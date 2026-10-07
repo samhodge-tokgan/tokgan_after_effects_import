@@ -18,6 +18,15 @@ original motivation. The layer is created with motion blur already enabled.
 
 [sib]: https://github.com/samhodge-aiml/tokgan_silhouette_import
 
+## Schema compatibility
+
+Accepts `lozenge_bezier_anim` schema **v2 and v3**. The v3 additions
+(top-level `camera` + `persons` reference-frame blocks, from
+Rotobot-Next issue #279) are read-and-ignored by this converter — AE
+shape layers don't yet consume the plate-camera or person-root data,
+so new fields pass through harmlessly. Older v2 JSONs keep working
+unchanged.
+
 ## Requirements
 
 * Python 3.8+ (standard library only — no `pip install` step).
