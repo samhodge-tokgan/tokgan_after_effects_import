@@ -22,6 +22,23 @@ exists in. The loader retimes all keys to the active comp's frame rate so
 each source frame lands on one comp frame regardless of the JSON's declared
 fps. Motion blur is enabled on the layer.
 
+v3 JSONs (camera + persons blocks, Rotobot Next 0.10.0+) build a HIERARCHY
+instead (pass --flat for the single layer above):
+
+    main comp
+      "Tokgan Shapes"  -- a precomp layer with a Corner Pin keyed every frame:
+                          the plate camera, as the exact ECC homography
+        "Tokgan Stabilised" precomp (camera removed, padded to fit):
+          p<N>_pelvis  -- Null per person, position keyed every frame
+            <object>   -- shape layer per body part, parented to its person,
+                          position + rotation keyed from the bone; the path
+                          is in bone-local pixels
+
+so an artist can stabilise, move a whole person, or adjust one limb without
+touching every vertex. The decomposition comes from rotobot-nuke's
+rotobot_nuke.hierarchy (pip install rotobot-nuke); the composed result is
+checked against every source vertex before anything is written.
+
 Use `python3 tokgan_json_to_ae.py --help` for invocation details.
 
 Coordinate convention:
@@ -46,7 +63,12 @@ BACKGROUND_DIM_DIVISOR = 20
 # would have to handle. Sidecars whose stored value differs from this
 # constant are rebuilt on the next run regardless of mtime, so older
 # sidecars without `color` don't quietly stay around.
-PAYLOAD_SCHEMA = 2
+PAYLOAD_SCHEMA = 3
+
+# Hierarchy mode: the stabilised precomp is padded this far beyond the
+# stabilised extent of every vertex, and must stay within AE's comp limit.
+PRECOMP_MARGIN = 64
+AE_MAX_COMP_SIZE = 30000
 
 BACKGROUND_GREY = [0.5, 0.5, 0.5]
 
@@ -208,6 +230,124 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
         "outT": out_all,
         "opacity": opacity,
     } if times else None
+
+
+def _r(v, nd=3):
+    return round(v, nd)
+
+
+def build_hierarchy_payload(in_path, data, keep_names, person_color,
+                            width, height, fps, start_frame, end_frame):
+    """Payload for the hierarchy loader: camera corner pin, person Nulls and
+    bone-local shape layers. Raises SystemExit with a fix when rotobot-nuke
+    is missing or the decomposition does not reproduce the source."""
+    try:
+        from rotobot_nuke import load_json
+        from rotobot_nuke.hierarchy import (
+            ROUND_TRIP_TOLERANCE_PX, apply_h, decompose, round_trip_error)
+    except ImportError:
+        raise SystemExit(
+            "This JSON has camera/person data (schema v3). Building the AE "
+            "hierarchy needs rotobot-nuke:\n"
+            "    pip install rotobot-nuke\n"
+            "or pass --flat for the single-layer import.")
+
+    doc = load_json(in_path)
+    doc.objects = {k: o for k, o in doc.objects.items() if k in keep_names}
+    hier = decompose(doc)
+    err = round_trip_error(doc, hier)
+    if err > ROUND_TRIP_TOLERANCE_PX:
+        raise SystemExit(
+            "hierarchy does not reproduce the source vertices (worst error "
+            "%.3f px > %.2f px); use --flat for this file" % (err, ROUND_TRIP_TOLERANCE_PX))
+
+    # Stabilised extent of everything the precomp has to hold: every vertex
+    # and handle, plus the seed plate itself.
+    xs, ys = [0.0, float(width)], [0.0, float(height)]
+    for key, obj in doc.objects.items():
+        for f, fr in obj.frames.items():
+            inv = hier.camera_inv[f]
+            for p in fr.points:
+                for x, y in ((p.x, p.y), (p.left_x, p.left_y), (p.right_x, p.right_y)):
+                    sx, sy = apply_h(inv, x, y)
+                    xs.append(sx); ys.append(sy)
+    ox = PRECOMP_MARGIN - int(min(xs) // 1)
+    oy = PRECOMP_MARGIN - int(min(ys) // 1)
+    pw = int(max(xs) // 1) + 1 + ox + PRECOMP_MARGIN
+    ph = int(max(ys) // 1) + 1 + oy + PRECOMP_MARGIN
+    if max(pw, ph) > AE_MAX_COMP_SIZE:
+        raise SystemExit(
+            "the stabilised precomp would be %dx%d, beyond After Effects' "
+            "%d px limit (a very long camera move); use --flat" % (pw, ph, AE_MAX_COMP_SIZE))
+
+    def t_of(f):
+        return round((f - start_frame) / fps, 6)
+
+    # Corner Pin, AE's order: upper-left, upper-right, lower-left, lower-right
+    # of the precomp layer, each mapped through the frame's homography.
+    cam_times, cam_corners = [], []
+    for f in hier.frames:
+        h = hier.camera[f]
+        cam_times.append(t_of(f))
+        cam_corners.append([
+            [_r(c) for c in apply_h(h, cx - ox, cy - oy)]
+            for cx, cy in ((0, 0), (pw, 0), (0, ph), (pw, ph))
+        ])
+
+    persons = []
+    for pid in sorted({hier.person_of[k] for k in doc.objects}):
+        series = hier.pelvis[pid]
+        persons.append({
+            "pid": pid,
+            "name": "p%d_pelvis" % pid,
+            "times": [t_of(f) for f in hier.frames],
+            "pos": [[_r(series[f][0] + ox), _r(series[f][1] + oy)] for f in hier.frames],
+        })
+
+    shapes = []
+    for key, obj in doc.objects.items():
+        raw_obj = data["objects"][key]
+        flat = build_shape_record(key, raw_obj, height, start_frame, end_frame, fps)
+        if not flat:
+            continue
+        times, verts, in_t, out_t, xf_pos, xf_rot = [], [], [], [], [], []
+        for f in sorted(obj.frames):
+            pts = hier.knots[key][f]
+            if not pts:
+                continue
+            part = hier.parts[key][f]
+            times.append(t_of(f))
+            verts.append([[_r(q.x), _r(q.y)] for q in pts])
+            in_t.append([[_r(q.left_x - q.x), _r(q.left_y - q.y)] for q in pts])
+            out_t.append([[_r(q.right_x - q.x), _r(q.right_y - q.y)] for q in pts])
+            xf_pos.append([_r(part.tx), _r(part.ty)])
+            xf_rot.append(_r(part.angle, 5))
+        shapes.append({
+            "name": key,
+            "pid": hier.person_of[key],
+            "closed": flat["closed"],
+            "color": person_color[hier.person_of[key]],
+            "times": times,
+            "verts": verts,
+            "inT": in_t,
+            "outT": out_t,
+            "xf": {"pos": xf_pos, "rot": xf_rot},
+            "opacity": flat["opacity"],
+        })
+
+    return {
+        "schema": PAYLOAD_SCHEMA,
+        "mode": "hierarchy",
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "duration": (end_frame - start_frame + 1) / fps,
+        "precomp": {"width": pw, "height": ph, "offset": [ox, oy]},
+        "camera": {"times": cam_times, "corners": cam_corners},
+        "persons": persons,
+        "shapes": shapes,
+        "held": hier.held,
+    }
 
 
 LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
@@ -410,6 +550,190 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
 assert LOADER_TEMPLATE.isascii(), "LOADER_TEMPLATE must be pure ASCII"
 
 
+# Hierarchy loader (v3 JSONs). Kept separate from LOADER_TEMPLATE so the flat
+# import is untouched. Plain ExtendScript (ES3): no let, no arrow functions.
+# __DATA_BASENAME__ is substituted with str.replace, so braces need no escaping.
+LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (camera / person hierarchy).
+// Sidecar JSON (__DATA_BASENAME__) is expected next to this script.
+(function() {
+    var STEP = "init";
+    try {
+        STEP = "find-sidecar";
+        var expectedName = "__DATA_BASENAME__";
+        var siblings = (new File($.fileName)).parent.getFiles();
+        var dataFile = null;
+        for (var fi = 0; fi < siblings.length; fi++) {
+            if (siblings[fi] instanceof File && siblings[fi].displayName === expectedName) {
+                dataFile = siblings[fi];
+                break;
+            }
+        }
+        if (!dataFile) {
+            dataFile = File.openDialog(
+                "Locate sidecar: " + expectedName +
+                " (generated by tokgan_json_to_ae.py, NOT the raw Tokgan JSON)");
+            if (!dataFile) return;
+        }
+
+        STEP = "read-sidecar (" + dataFile.fsName + ")";
+        dataFile.encoding = "UTF-8";
+        if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
+        var raw = dataFile.read();
+        dataFile.close();
+
+        STEP = "json-parse (" + raw.length + " chars)";
+        var data = (typeof JSON !== "undefined" && JSON.parse) ? JSON.parse(raw) : eval("(" + raw + ")");
+        if (data.mode !== "hierarchy" || !data.camera || !data.precomp) {
+            throw new Error(dataFile.displayName + " is not a Tokgan hierarchy sidecar; " +
+                            "re-run tokgan_json_to_ae.py on the raw JSON.");
+        }
+
+        app.beginUndoGroup("Import Tokgan Hierarchy");
+
+        STEP = "init-comp";
+        var comp = app.project.activeItem;
+        if (!(comp instanceof CompItem)) {
+            comp = app.project.items.addComp("TokganShapes", data.width, data.height, 1,
+                                             data.duration, data.fps);
+        }
+        comp.motionBlur = true;
+        var fpsScale = data.fps / comp.frameRate;
+
+        // Re-runs replace cleanly: the layer in this comp, then the precomp.
+        for (var rl = comp.numLayers; rl >= 1; rl--) {
+            if (comp.layer(rl).name === "Tokgan Shapes") comp.layer(rl).remove();
+        }
+        for (var ri = app.project.numItems; ri >= 1; ri--) {
+            var it = app.project.item(ri);
+            if (it instanceof CompItem && it.name === "Tokgan Stabilised") it.remove();
+        }
+
+        function scaled(times) {
+            var out = new Array(times.length);
+            for (var i = 0; i < times.length; i++) out[i] = times[i] * fpsScale;
+            return out;
+        }
+        // Linear in time, and straight lines in space for position: the
+        // undersampler measures error against linear interpolation.
+        function keyLinear(prop, times, values) {
+            try { prop.setValuesAtTimes(times, values); }
+            catch (e) { for (var i = 0; i < times.length; i++) prop.setValueAtTime(times[i], values[i]); }
+            var spatial = prop.propertyValueType === PropertyValueType.TwoD_SPATIAL ||
+                          prop.propertyValueType === PropertyValueType.ThreeD_SPATIAL;
+            var zero = prop.propertyValueType === PropertyValueType.ThreeD_SPATIAL ? [0, 0, 0] : [0, 0];
+            for (var k = 1; k <= prop.numKeys; k++) {
+                prop.setInterpolationTypeAtKey(k, KeyframeInterpolationType.LINEAR,
+                                               KeyframeInterpolationType.LINEAR);
+                if (spatial) {
+                    prop.setSpatialAutoBezierAtKey(k, false);
+                    prop.setSpatialContinuousAtKey(k, false);
+                    prop.setSpatialTangentsAtKey(k, zero, zero);
+                }
+            }
+        }
+        function mkShape(v, i, o, c) {
+            var s = new Shape();
+            s.vertices = v; s.inTangents = i; s.outTangents = o; s.closed = c;
+            return s;
+        }
+
+        STEP = "precomp";
+        var pre = app.project.items.addComp("Tokgan Stabilised", data.precomp.width,
+                                            data.precomp.height, 1, comp.duration, comp.frameRate);
+        pre.motionBlur = true;
+
+        STEP = "persons";
+        var nulls = {};
+        for (var pi = 0; pi < data.persons.length; pi++) {
+            var pd = data.persons[pi];
+            var nl = pre.layers.addNull(pre.duration);
+            nl.name = pd.name;
+            // Anchor at the Null's own origin, so a child's position is its
+            // offset from the pelvis and nothing else.
+            nl.transform.anchorPoint.setValue([0, 0]);
+            keyLinear(nl.transform.position, scaled(pd.times), pd.pos);
+            nulls[pd.pid] = nl;
+        }
+
+        STEP = "shapes";
+        for (var s = data.shapes.length - 1; s >= 0; s--) {
+            var sd = data.shapes[s];
+            STEP = "shape " + (s + 1) + "/" + data.shapes.length + " (" + sd.name + ")";
+            var sl = pre.layers.addShape();
+            sl.name = sd.name;
+            sl.transform.anchorPoint.setValue([0, 0]);
+            // Parent BEFORE keying, without compensation: the keyed values
+            // are already in the parent's space.
+            if (nulls[sd.pid]) sl.setParentWithJump(nulls[sd.pid]);
+            var st = scaled(sd.times);
+            keyLinear(sl.transform.position, st, sd.xf.pos);
+            keyLinear(sl.transform.rotation, st, sd.xf.rot);
+            sl.motionBlur = true;
+
+            var root = sl.property("ADBE Root Vectors Group");
+            var grp = root.addProperty("ADBE Vector Group");
+            grp.name = sd.name;
+            var inside = grp.property("ADBE Vectors Group");
+            // AE 25.6: add every property first, then re-acquire references.
+            inside.addProperty("ADBE Vector Shape - Group");
+            inside.addProperty("ADBE Vector Graphic - Fill");
+            var pathItem = null, fillItem = null;
+            for (var pp = 1; pp <= inside.numProperties; pp++) {
+                var mn = inside.property(pp).matchName;
+                if (mn === "ADBE Vector Shape - Group") pathItem = inside.property(pp);
+                else if (mn === "ADBE Vector Graphic - Fill") fillItem = inside.property(pp);
+            }
+            if (fillItem && sd.color) fillItem.property("ADBE Vector Fill Color").setValue(sd.color);
+            var shapesAt = new Array(sd.times.length);
+            for (var i = 0; i < sd.times.length; i++) {
+                shapesAt[i] = mkShape(sd.verts[i], sd.inT[i], sd.outT[i], sd.closed);
+            }
+            var pathProp = pathItem.property("ADBE Vector Shape");
+            try { pathProp.setValuesAtTimes(st, shapesAt); }
+            catch (e) { for (var j = 0; j < st.length; j++) pathProp.setValueAtTime(st[j], shapesAt[j]); }
+
+            if (sd.opacity.length > 0) {
+                var op = grp.property("ADBE Vector Transform Group").property("ADBE Vector Group Opacity");
+                for (var q = 0; q < sd.opacity.length; q++) {
+                    op.setValueAtTime(sd.opacity[q][0] * fpsScale, sd.opacity[q][1]);
+                    op.setInterpolationTypeAtKey(op.numKeys, KeyframeInterpolationType.HOLD,
+                                                 KeyframeInterpolationType.HOLD);
+                }
+            }
+        }
+
+        STEP = "camera";
+        var lay = comp.layers.add(pre);
+        lay.name = "Tokgan Shapes";
+        // Layer space == comp space, so the Corner Pin points are plate pixels.
+        lay.transform.anchorPoint.setValue([0, 0]);
+        lay.transform.position.setValue([0, 0]);
+        lay.motionBlur = true;
+        var pin = lay.property("ADBE Effect Parade").addProperty("ADBE Corner Pin");
+        var ct = scaled(data.camera.times);
+        var corners = data.camera.corners;
+        var names = ["ADBE Corner Pin-0001", "ADBE Corner Pin-0002",
+                     "ADBE Corner Pin-0003", "ADBE Corner Pin-0004"];
+        for (var c = 0; c < 4; c++) {
+            var vals = new Array(corners.length);
+            for (var k2 = 0; k2 < corners.length; k2++) vals[k2] = corners[k2][c];
+            keyLinear(pin.property(names[c]), ct, vals);
+        }
+
+        app.endUndoGroup();
+        $.writeln("[Tokgan hierarchy] " + data.persons.length + " persons, " +
+                  data.shapes.length + " parts, " + data.camera.times.length + " camera keys");
+    } catch (err) {
+        try { app.endUndoGroup(); } catch (e2) {}
+        alert("Tokgan import failed.\nStep: " + STEP + "\nError: " + err.toString() +
+              "\nLine:  " + (err.line || "?"));
+    }
+})();
+"""
+
+assert LOADER_HIER_TEMPLATE.isascii(), "LOADER_HIER_TEMPLATE must be pure ASCII"
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(
@@ -417,8 +741,10 @@ def main():
         description=(
             "Convert a Tokgan JSON shape file into an After Effects loader "
             "(.jsx) plus a compact sidecar data JSON. Run the resulting "
-            ".jsx in AE via File > Scripts > Run Script File... to build a "
-            "single shape layer holding one animated Bezier path per object."
+            ".jsx in AE via File > Scripts > Run Script File... A v2 JSON "
+            "builds one shape layer holding an animated Bezier path per "
+            "object; a v3 JSON (camera + person data) builds a camera Corner "
+            "Pin, a Null per person and a shape layer per body part."
         ),
         epilog=(
             "Notes: each source frame lands on one comp frame regardless of "
@@ -464,7 +790,17 @@ def main():
             "footage's true fps (e.g. --fps 25) to fix the timing."
         ),
     )
+    p.add_argument(
+        "--flat",
+        action="store_true",
+        help=(
+            "Always build the single 'Tokgan Shapes' layer, even for a v3 "
+            "JSON with camera/person data (which otherwise builds the "
+            "camera / person / body-part hierarchy)."
+        ),
+    )
     args = p.parse_args()
+    requested = "flat" if args.flat else "auto"
 
     in_path = args.input
     out_jsx = args.output or os.path.splitext(in_path)[0] + ".jsx"
@@ -475,10 +811,16 @@ def main():
     # the same payload schema. The schema check makes adding new fields
     # (like `color`) safe -- older sidecars get rebuilt automatically.
     sidecar_schema_ok = False
+    sidecar_mode = "flat"
     if os.path.exists(out_data):
         try:
             with open(out_data, encoding="utf-8") as _sf:
-                sidecar_schema_ok = json.load(_sf).get("schema") == PAYLOAD_SCHEMA
+                _side = json.load(_sf)
+            # --flat changes the output for the same input, so a sidecar is
+            # only reusable when it was built with the same request.
+            sidecar_schema_ok = (_side.get("schema") == PAYLOAD_SCHEMA
+                                 and _side.get("requested") == requested)
+            sidecar_mode = _side.get("mode", "flat")
         except (OSError, ValueError):
             sidecar_schema_ok = False
 
@@ -495,6 +837,7 @@ def main():
     )
 
     summary_extra = ""
+    mode = sidecar_mode
 
     if data_is_current:
         print(f"Reusing existing data file (newer than input): {out_data}")
@@ -524,31 +867,53 @@ def main():
         )
         bg_set = set(bg_ids)
 
-        shapes = []
-        for obj_name, obj in data["objects"].items():
-            pid = person_id_of(obj_name, obj)
-            if pid in bg_set and not args.keep_background:
-                continue
-            rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
-            if rec:
-                rec["color"] = person_color[pid]
-                shapes.append(rec)
+        keep_names = [
+            name for name, obj in data["objects"].items()
+            if args.keep_background or person_id_of(name, obj) not in bg_set
+        ]
+        has_v3 = bool(data.get("camera") or data.get("persons"))
+        mode = "hierarchy" if (has_v3 and not args.flat) else "flat"
 
-        payload = {
-            "schema": PAYLOAD_SCHEMA,
-            "width": width,
-            "height": height,
-            "fps": fps,
-            "duration": duration,
-            "shapes": shapes,
-        }
+        if mode == "hierarchy":
+            payload = build_hierarchy_payload(
+                in_path, data, set(keep_names), person_color,
+                width, height, fps, start_frame, end_frame)
+            shapes = payload["shapes"]
+            pre = payload["precomp"]
+            summary_extra += (
+                f"  Hierarchy: {len(payload['persons'])} person Null(s), "
+                f"{len(shapes)} part layers, camera Corner Pin on "
+                f"{len(payload['camera']['times'])} frames; stabilised "
+                f"precomp {pre['width']}x{pre['height']}\n"
+            )
+            if payload["held"]:
+                summary_extra += f"  Held (missing/failed data): {len(payload['held'])} frame(s)\n"
+        else:
+            shapes = []
+            for obj_name in keep_names:
+                obj = data["objects"][obj_name]
+                pid = person_id_of(obj_name, obj)
+                rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
+                if rec:
+                    rec["color"] = person_color[pid]
+                    shapes.append(rec)
+            payload = {
+                "schema": PAYLOAD_SCHEMA,
+                "mode": "flat",
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "duration": duration,
+                "shapes": shapes,
+            }
+        payload["requested"] = requested
 
         with open(out_data, "w", encoding="utf-8", newline="\n") as f:
             json.dump(payload, f, separators=(",", ":"))
 
         n_shapes = len(shapes)
         bg_state = "kept" if args.keep_background else "dropped"
-        summary_extra = (
+        summary_extra += (
             f"  Persons: {len(fg_ids)} foreground, "
             f"{len(bg_ids)} background ({bg_state})\n"
         )
@@ -560,7 +925,10 @@ def main():
                     f"    p{pid}: ({int(round(r*255))},{int(round(g*255))},{int(round(b*255))})\n"
                 )
 
-    loader = LOADER_TEMPLATE.format(data_basename=os.path.basename(out_data))
+    if mode == "hierarchy":
+        loader = LOADER_HIER_TEMPLATE.replace("__DATA_BASENAME__", os.path.basename(out_data))
+    else:
+        loader = LOADER_TEMPLATE.format(data_basename=os.path.basename(out_data))
     with open(out_jsx, "w", encoding="utf-8", newline="\n") as f:
         f.write(loader)
 

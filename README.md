@@ -4,8 +4,9 @@ Import Tokgan ML shape data directly into Adobe After Effects as native shape
 layers, bypassing the Silhouette → Adobe Premiere/AE export round-trip used
 by the sibling [tokgan_silhouette_import][sib] tool.
 
-The output is **one** AE shape layer named *Tokgan Shapes* containing one
-Vector Group per source object. Each group has:
+For a **v2** JSON (or with `--flat`), the output is **one** AE shape layer
+named *Tokgan Shapes* containing one Vector Group per source object. Each
+group has:
 
 * a Bezier path animated frame-by-frame,
 * a hold-stepped opacity track driven by which source frames the object
@@ -18,14 +19,53 @@ original motivation. The layer is created with motion blur already enabled.
 
 [sib]: https://github.com/samhodge-aiml/tokgan_silhouette_import
 
+For a **v3** JSON (Rotobot Next 0.10.0 and later, which adds the plate
+camera and per-person data) it builds a camera / person / body-part
+**hierarchy** instead — see below.
+
 ## Schema compatibility
 
-Accepts `lozenge_bezier_anim` schema **v2 and v3**. The v3 additions
-(top-level `camera` + `persons` reference-frame blocks, from
-Rotobot-Next issue #279) are read-and-ignored by this converter — AE
-shape layers don't yet consume the plate-camera or person-root data,
-so new fields pass through harmlessly. Older v2 JSONs keep working
-unchanged.
+Accepts `lozenge_bezier_anim` schema **v2 and v3**. v2 JSONs import as the
+single flat layer, unchanged. v3 JSONs build the hierarchy; `--flat` gives
+the single layer for them too.
+
+## The v3 hierarchy
+
+```
+main comp
+  Tokgan Shapes          precomp layer + Corner Pin (keyed every frame)
+                         = the plate camera
+    Tokgan Stabilised    precomp: the camera removed
+      p0_pelvis          Null per person, position keyed every frame
+        p0:arm:L:forearm shape layer per body part, parented to the person:
+        p0:leg:R:thigh   position + rotation from the bone, path in
+        ...              bone-local pixels
+```
+
+* **Camera — exact.** Rotobot's camera solve is a full perspective
+  homography. AE can't parent a perspective transform, so the camera is a
+  **Corner Pin** on the precomp layer: four points that reproduce the
+  homography exactly (an affine approximation was up to 236 px off at the
+  plate corners on a real 4K clip). Turn the Corner Pin off to see the
+  stabilised rig.
+* **Person.** One Null per person at the pelvis; move it to move the whole
+  person.
+* **Body part.** One shape layer per part, positioned and rotated by its
+  bone, so a limb can be adjusted without touching its vertices.
+* The stabilised precomp is sized to fit everything once the camera is
+  removed (a long pan makes it wider than the plate).
+* Missing or failed tracking (a failed camera frame, no hips detected, a
+  frame without a bone) holds the last good value instead of jumping; the
+  converter reports how many frames were held.
+* Before writing anything the converter recomposes every vertex through
+  the hierarchy and refuses if any lands more than 0.05 px from the source.
+  The decomposition comes from
+  [`rotobot-nuke`](https://github.com/samhodge-tokgan/rotobot-nuke)'s
+  `rotobot_nuke.hierarchy`, shared with the Nuke and Silhouette importers.
+
+Position, rotation and Corner Pin keys are linear, so a JSON thinned with
+`rotobot-undersample` (below) interpolates the way its error metric
+assumed.
 
 ### Reducing keyframe count before import
 
@@ -54,7 +94,10 @@ The pre-pass is optional — direct conversion still works unchanged.
 
 ## Requirements
 
-* Python 3.8+ (standard library only — no `pip install` step).
+* Python 3.9+. Standard library only for v2 / `--flat`; a v3 hierarchy
+  import also needs `pip install rotobot-nuke` (until it is on PyPI:
+  `pip install git+https://github.com/samhodge-tokgan/rotobot-nuke`).
+  Without it the converter says so and suggests `--flat`.
 * After Effects 2024+ (tested on AE 25.6 / Mac).
 * The AE preference **Allow Scripts to Write Files and Access Network**
   must be enabled — `Settings > Scripting & Expressions`. Without it the
@@ -92,21 +135,41 @@ new one.
 
 ```
 $ python3 tokgan_json_to_ae.py --help
-usage: tokgan_json_to_ae [-h] [-f] input [output]
+usage: tokgan_json_to_ae [-h] [-f] [--keep-background] [--fps FPS] [--flat]
+                         input [output]
 
 Convert a Tokgan JSON shape file into an After Effects loader (.jsx) plus a
 compact sidecar data JSON. Run the resulting .jsx in AE via File > Scripts >
-Run Script File... to build a single shape layer holding one animated Bezier
-path per object.
+Run Script File... A v2 JSON builds one shape layer holding an animated Bezier
+path per object; a v3 JSON (camera + person data) builds a camera Corner Pin,
+a Null per person and a shape layer per body part.
 
 positional arguments:
-  input        Path to input Tokgan JSON file
-  output       Path to write the AE loader .jsx (default: same dir/name as
-               the input with .jsx extension).
+  input              Path to input Tokgan JSON file
+  output             Path to write the AE loader .jsx (default: same dir/name
+                     as the input with .jsx extension). The sidecar will be
+                     written next to it as <output_stem>_data.json.
 
 options:
-  -h, --help   show this help message and exit
-  -f, --force  Rebuild the sidecar data file even if it's newer than the input.
+  -h, --help         show this help message and exit
+  -f, --force        Rebuild the sidecar data file even if it's newer than the
+                     input.
+  --keep-background  Import 'background' persons (max-over-time bbox dim <
+                     max(comp_w, comp_h)/20) as a single neutral-grey fill
+                     instead of dropping them. Off by default to save AE
+                     keyframe-writing time on crowded clips.
+  --fps FPS          Override the fps declared in the JSON metadata. Tokgan
+                     exports stamp every file with fps=24 even when the source
+                     video runs at e.g. 25 fps, which makes the shapes play
+                     ~4% faster than the matching footage in AE. Pass the
+                     footage's true fps (e.g. --fps 25) to fix the timing.
+  --flat             Always build the single 'Tokgan Shapes' layer, even for a
+                     v3 JSON with camera/person data (which otherwise builds
+                     the camera / person / body-part hierarchy).
+
+Notes: each source frame lands on one comp frame regardless of the JSON's
+declared fps. Enable 'Allow Scripts to Write Files and Access Network' in AE's
+preferences (Scripting & Expressions) before running the loader.
 ```
 
 ## What the loader does, in order
@@ -161,7 +224,12 @@ To use the imported shape layer as an animated alpha matte on footage:
 2. On the footage layer, set the **Track Matte** column to *Tokgan Shapes*
    (defaults to Alpha Matte).
 
-Motion blur on the shape layer carries through to the matte edges. For
+With a v3 hierarchy, *Tokgan Shapes* is the precomp layer carrying the
+camera Corner Pin; use it as the Track Matte in exactly the same way.
+
+Motion blur on the shape layer carries through to the matte edges. In a
+v3 hierarchy the body-part layers blur inside the stabilised precomp; the
+camera move itself is a Corner Pin effect, which AE does not motion-blur. For
 naturally-centered blur, set the comp's **Shutter Phase** to half the
 negative **Shutter Angle** (e.g. `-90°` when shutter is `180°`) under
 `Composition Settings > Advanced`.

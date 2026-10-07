@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # node runs the generated hierarchy loader under tests/ae_mock.js.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install test dependencies
+        # rotobot-nuke provides rotobot_nuke.hierarchy (v3 camera/person
+        # decomposition). From git until it is on PyPI.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest "rotobot-nuke @ git+https://github.com/samhodge-tokgan/rotobot-nuke@main"
+      - run: pytest -q tests
