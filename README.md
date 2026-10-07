@@ -27,6 +27,31 @@ shape layers don't yet consume the plate-camera or person-root data,
 so new fields pass through harmlessly. Older v2 JSONs keep working
 unchanged.
 
+### Reducing keyframe count before import
+
+The converter writes **every** frame of each spline as an AE keyframe.
+On a 24 fps action clip that's ~ 24 keyframes per second per spline
+per person — AE can scrub it, but hand-tweaks become tedious.
+
+For an actor whose articulation is captured in a Rotobot-Next v3 JSON,
+pre-pass through [`rotobot-undersample`](https://pypi.org/project/rotobot-nuke/)
+before running this converter:
+
+```bash
+pip install rotobot-nuke        # provides the `rotobot-undersample` CLI
+rotobot-undersample shapes.json shapes_reduced.json --preset balanced
+python tokgan_json_to_ae.py shapes_reduced.json
+```
+
+The `balanced` preset keeps ~ 89% of keyframes on a measured 4-clip
+real-plate benchmark (3 pp spread across clips), dropping the ones
+that are linear interpolations of their neighbours in a composed
+camera + person-root + body-local-articulation metric. See
+[`rotobot-nuke/benchmarks/real_results_cross_clip.md`](https://github.com/samhodge-tokgan/rotobot-nuke/blob/main/benchmarks/real_results_cross_clip.md)
+for the methodology + fine/coarse alternatives.
+
+The pre-pass is optional — direct conversion still works unchanged.
+
 ## Requirements
 
 * Python 3.8+ (standard library only — no `pip install` step).
