@@ -108,6 +108,17 @@ The source footage for this clip is Pexels video **9961755** (UHD 2160 ×
 4096, 25 fps); download from <https://www.pexels.com> and import as an
 image sequence or video to match against the imported shapes.
 
+## Sharing with other machines
+
+The `.jsx` is only a loader; the shape data lives in the `_data.json`
+sidecar. **Always send both files together** (same folder, original
+names). Sending just the `.jsx` gets you a "Locate sidecar" dialog in AE,
+and picking the raw Tokgan JSON there will not work. Alternatively, send
+only the raw Tokgan JSON and have the recipient run the converter.
+
+Output is identical on Mac, Linux and Windows: the `.jsx` is pure ASCII
+with LF line endings, and the sidecar is UTF-8 with LF line endings.
+
 ## Compositing
 
 To use the imported shape layer as an animated alpha matte on footage:
