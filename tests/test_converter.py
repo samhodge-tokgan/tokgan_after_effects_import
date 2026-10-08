@@ -132,3 +132,26 @@ class TestLoaderUnderMockAE:
         assert res["shape_layers"] == 2 and res["parented"] == 2 and res["nulls"] == 1
         assert res["vertices_checked"] > 0
         assert res["worst_px"] < 0.05, res
+
+
+class TestConvertAPI:
+    """convert() is what Rotobot Queue calls; the CLI is a wrapper over it."""
+
+    def test_returns_what_it_wrote(self, tmp_path):
+        src = tmp_path / "clip.json"
+        shutil.copy(FIXTURES / "v3_real_cut.json", src)
+        lines = []
+        r = conv.convert(str(src), log=lines.append)
+        assert r.mode == "hierarchy" and r.shapes == 2 and r.held == []
+        assert Path(r.jsx).is_file() and Path(r.data).is_file()
+        assert Path(r.data).name == "clip_data.json"
+        assert any("Hierarchy:" in s for s in lines)
+
+    def test_explicit_output_and_flat(self, tmp_path):
+        src = tmp_path / "clip.json"
+        shutil.copy(FIXTURES / "v3_real_cut.json", src)
+        r = conv.convert(str(src), str(tmp_path / "shot_010.jsx"), flat=True,
+                         log=lambda s: None)
+        assert r.mode == "flat"
+        assert Path(r.jsx).name == "shot_010.jsx"
+        assert Path(r.data).name == "shot_010_data.json"
