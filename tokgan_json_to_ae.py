@@ -52,6 +52,7 @@ import colorsys
 import json
 import os
 import sys
+from typing import NamedTuple
 
 
 # Persons whose maximum-over-time bounding-box max dimension is smaller
@@ -755,6 +756,163 @@ LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (ca
 assert LOADER_HIER_TEMPLATE.isascii(), "LOADER_HIER_TEMPLATE must be pure ASCII"
 
 
+class ConvertResult(NamedTuple):
+    jsx: str          # the loader to run in After Effects
+    data: str         # its sidecar, which must stay next to it
+    mode: str         # "hierarchy" or "flat"
+    shapes: object    # shape/part count, or "?" when a cached sidecar was reused
+    held: list        # hierarchy notes for missing/failed tracking that was held
+
+
+def convert(in_path_arg, out_jsx_arg=None, *, flat=False, keep_background=False,
+            fps_override=None, force=False, log=print):
+    """Write the AE loader (.jsx) and its sidecar for one shape JSON.
+
+    The command line is a thin wrapper around this; Rotobot Queue calls it
+    directly. `log` receives the same progress lines the CLI prints.
+    """
+    requested = "flat" if flat else "auto"
+
+    in_path = in_path_arg
+    out_jsx = out_jsx_arg or os.path.splitext(in_path)[0] + ".jsx"
+    out_data = os.path.splitext(out_jsx)[0] + "_data.json"
+
+    # Reuse the sidecar only if (a) the user didn't force, (b) it's newer
+    # than the input, AND (c) it was written by a code build that produced
+    # the same payload schema. The schema check makes adding new fields
+    # (like `color`) safe -- older sidecars get rebuilt automatically.
+    sidecar_schema_ok = False
+    sidecar_mode = "flat"
+    if os.path.exists(out_data):
+        try:
+            with open(out_data, encoding="utf-8") as _sf:
+                _side = json.load(_sf)
+            # --flat changes the output for the same input, so a sidecar is
+            # only reusable when it was built with the same request.
+            sidecar_schema_ok = (_side.get("schema") == PAYLOAD_SCHEMA
+                                 and _side.get("requested") == requested)
+            sidecar_mode = _side.get("mode", "flat")
+        except (OSError, ValueError):
+            sidecar_schema_ok = False
+
+    # --fps and --keep-background change sidecar contents without changing
+    # the input file's mtime, so an mtime-only cache check would silently
+    # serve a stale sidecar that ignores the flag. Force rebuild whenever
+    # either is set.
+    data_is_current = (
+        not force
+        and not keep_background
+        and fps_override is None
+        and sidecar_schema_ok
+        and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
+    )
+
+    summary_extra = ""
+    mode = sidecar_mode
+
+    if data_is_current:
+        log(f"Reusing existing data file (newer than input): {out_data}")
+        n_shapes = "?"  # not loaded; reported as ? in the summary
+    else:
+        with open(in_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        res = data.get("resolution", [data.get("width", 2160), data.get("height", 4096)])
+        width, height = int(res[0]), int(res[1])
+        json_fps = float(data.get("fps", 24))
+        fps = float(fps_override) if fps_override else json_fps
+        if fps_override and fps_override != json_fps:
+            log(f"  fps override: JSON says {json_fps}, using {fps}")
+
+        all_frames = set()
+        for obj in data["objects"].values():
+            for fkey in obj.get("frames", {}).keys():
+                all_frames.add(int(fkey))
+        start_frame = min(all_frames) if all_frames else 1
+        end_frame = max(all_frames) if all_frames else 48
+        n_frames = end_frame - start_frame + 1
+        duration = n_frames / fps
+
+        person_color, fg_ids, bg_ids = classify_persons(
+            data["objects"], width, height
+        )
+        bg_set = set(bg_ids)
+
+        keep_names = [
+            name for name, obj in data["objects"].items()
+            if keep_background or person_id_of(name, obj) not in bg_set
+        ]
+        has_v3 = bool(data.get("camera") or data.get("persons"))
+        mode = "hierarchy" if (has_v3 and not flat) else "flat"
+
+        if mode == "hierarchy":
+            payload = build_hierarchy_payload(
+                in_path, data, set(keep_names), person_color,
+                width, height, fps, start_frame, end_frame)
+            shapes = payload["shapes"]
+            pre = payload["precomp"]
+            summary_extra += (
+                f"  Hierarchy: {len(payload['persons'])} person Null(s), "
+                f"{len(shapes)} part layers, camera Corner Pin on "
+                f"{len(payload['camera']['times'])} frames; stabilised "
+                f"precomp {pre['width']}x{pre['height']}\n"
+            )
+            if payload["held"]:
+                summary_extra += f"  Held (missing/failed data): {len(payload['held'])} frame(s)\n"
+        else:
+            shapes = []
+            for obj_name in keep_names:
+                obj = data["objects"][obj_name]
+                pid = person_id_of(obj_name, obj)
+                rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
+                if rec:
+                    rec["color"] = person_color[pid]
+                    shapes.append(rec)
+            payload = {
+                "schema": PAYLOAD_SCHEMA,
+                "mode": "flat",
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "duration": duration,
+                "shapes": shapes,
+            }
+        payload["requested"] = requested
+
+        with open(out_data, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, separators=(",", ":"))
+
+        n_shapes = len(shapes)
+        bg_state = "kept" if keep_background else "dropped"
+        summary_extra += (
+            f"  Persons: {len(fg_ids)} foreground, "
+            f"{len(bg_ids)} background ({bg_state})\n"
+        )
+        if fg_ids:
+            summary_extra += "  Hues:\n"
+            for pid in fg_ids:
+                r, g, b = person_color[pid]
+                summary_extra += (
+                    f"    p{pid}: ({int(round(r*255))},{int(round(g*255))},{int(round(b*255))})\n"
+                )
+
+    if mode == "hierarchy":
+        loader = LOADER_HIER_TEMPLATE.replace("__DATA_BASENAME__", os.path.basename(out_data))
+    else:
+        loader = LOADER_TEMPLATE.format(data_basename=os.path.basename(out_data))
+    with open(out_jsx, "w", encoding="utf-8", newline="\n") as f:
+        f.write(loader)
+
+    result = ConvertResult(out_jsx, out_data, mode, n_shapes,
+                           list(payload.get("held", [])) if not data_is_current else [])
+    log(f"Wrote {out_jsx}  ({os.path.getsize(out_jsx):,} bytes)")
+    log(f"Data {out_data}  ({os.path.getsize(out_data):,} bytes)")
+    log(f"  Shapes: {n_shapes}")
+    if summary_extra:
+        log(summary_extra.rstrip("\n"))
+    return result
+
+
 def main():
     import argparse
     p = argparse.ArgumentParser(
@@ -821,143 +979,9 @@ def main():
         ),
     )
     args = p.parse_args()
-    requested = "flat" if args.flat else "auto"
-
-    in_path = args.input
-    out_jsx = args.output or os.path.splitext(in_path)[0] + ".jsx"
-    out_data = os.path.splitext(out_jsx)[0] + "_data.json"
-
-    # Reuse the sidecar only if (a) the user didn't force, (b) it's newer
-    # than the input, AND (c) it was written by a code build that produced
-    # the same payload schema. The schema check makes adding new fields
-    # (like `color`) safe -- older sidecars get rebuilt automatically.
-    sidecar_schema_ok = False
-    sidecar_mode = "flat"
-    if os.path.exists(out_data):
-        try:
-            with open(out_data, encoding="utf-8") as _sf:
-                _side = json.load(_sf)
-            # --flat changes the output for the same input, so a sidecar is
-            # only reusable when it was built with the same request.
-            sidecar_schema_ok = (_side.get("schema") == PAYLOAD_SCHEMA
-                                 and _side.get("requested") == requested)
-            sidecar_mode = _side.get("mode", "flat")
-        except (OSError, ValueError):
-            sidecar_schema_ok = False
-
-    # --fps and --keep-background change sidecar contents without changing
-    # the input file's mtime, so an mtime-only cache check would silently
-    # serve a stale sidecar that ignores the flag. Force rebuild whenever
-    # either is set.
-    data_is_current = (
-        not args.force
-        and not args.keep_background
-        and args.fps is None
-        and sidecar_schema_ok
-        and os.path.getmtime(out_data) >= os.path.getmtime(in_path)
-    )
-
-    summary_extra = ""
-    mode = sidecar_mode
-
-    if data_is_current:
-        print(f"Reusing existing data file (newer than input): {out_data}")
-        n_shapes = "?"  # not loaded; reported as ? in the summary
-    else:
-        with open(in_path, encoding="utf-8") as f:
-            data = json.load(f)
-
-        res = data.get("resolution", [data.get("width", 2160), data.get("height", 4096)])
-        width, height = int(res[0]), int(res[1])
-        json_fps = float(data.get("fps", 24))
-        fps = float(args.fps) if args.fps else json_fps
-        if args.fps and args.fps != json_fps:
-            print(f"  fps override: JSON says {json_fps}, using {fps}")
-
-        all_frames = set()
-        for obj in data["objects"].values():
-            for fkey in obj.get("frames", {}).keys():
-                all_frames.add(int(fkey))
-        start_frame = min(all_frames) if all_frames else 1
-        end_frame = max(all_frames) if all_frames else 48
-        n_frames = end_frame - start_frame + 1
-        duration = n_frames / fps
-
-        person_color, fg_ids, bg_ids = classify_persons(
-            data["objects"], width, height
-        )
-        bg_set = set(bg_ids)
-
-        keep_names = [
-            name for name, obj in data["objects"].items()
-            if args.keep_background or person_id_of(name, obj) not in bg_set
-        ]
-        has_v3 = bool(data.get("camera") or data.get("persons"))
-        mode = "hierarchy" if (has_v3 and not args.flat) else "flat"
-
-        if mode == "hierarchy":
-            payload = build_hierarchy_payload(
-                in_path, data, set(keep_names), person_color,
-                width, height, fps, start_frame, end_frame)
-            shapes = payload["shapes"]
-            pre = payload["precomp"]
-            summary_extra += (
-                f"  Hierarchy: {len(payload['persons'])} person Null(s), "
-                f"{len(shapes)} part layers, camera Corner Pin on "
-                f"{len(payload['camera']['times'])} frames; stabilised "
-                f"precomp {pre['width']}x{pre['height']}\n"
-            )
-            if payload["held"]:
-                summary_extra += f"  Held (missing/failed data): {len(payload['held'])} frame(s)\n"
-        else:
-            shapes = []
-            for obj_name in keep_names:
-                obj = data["objects"][obj_name]
-                pid = person_id_of(obj_name, obj)
-                rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
-                if rec:
-                    rec["color"] = person_color[pid]
-                    shapes.append(rec)
-            payload = {
-                "schema": PAYLOAD_SCHEMA,
-                "mode": "flat",
-                "width": width,
-                "height": height,
-                "fps": fps,
-                "duration": duration,
-                "shapes": shapes,
-            }
-        payload["requested"] = requested
-
-        with open(out_data, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(payload, f, separators=(",", ":"))
-
-        n_shapes = len(shapes)
-        bg_state = "kept" if args.keep_background else "dropped"
-        summary_extra += (
-            f"  Persons: {len(fg_ids)} foreground, "
-            f"{len(bg_ids)} background ({bg_state})\n"
-        )
-        if fg_ids:
-            summary_extra += "  Hues:\n"
-            for pid in fg_ids:
-                r, g, b = person_color[pid]
-                summary_extra += (
-                    f"    p{pid}: ({int(round(r*255))},{int(round(g*255))},{int(round(b*255))})\n"
-                )
-
-    if mode == "hierarchy":
-        loader = LOADER_HIER_TEMPLATE.replace("__DATA_BASENAME__", os.path.basename(out_data))
-    else:
-        loader = LOADER_TEMPLATE.format(data_basename=os.path.basename(out_data))
-    with open(out_jsx, "w", encoding="utf-8", newline="\n") as f:
-        f.write(loader)
-
-    print(f"Wrote {out_jsx}  ({os.path.getsize(out_jsx):,} bytes)")
-    print(f"Data {out_data}  ({os.path.getsize(out_data):,} bytes)")
-    print(f"  Shapes: {n_shapes}")
-    if summary_extra:
-        print(summary_extra, end="")
+    convert(args.input, args.output, flat=args.flat,
+            keep_background=args.keep_background, fps_override=args.fps,
+            force=args.force)
 
 
 if __name__ == "__main__":
