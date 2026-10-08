@@ -24,9 +24,10 @@ jobs:
         with:
           node-version: '20'
       - name: Install test dependencies
-        # rotobot-nuke provides rotobot_nuke.hierarchy (v3 camera/person
-        # decomposition). From git until it is on PyPI.
+        # Only pytest: the v3 hierarchy code is vendored (_rotobot_hierarchy/).
         run: |
           python -m pip install --upgrade pip
-          pip install pytest "rotobot-nuke @ git+https://github.com/samhodge-tokgan/rotobot-nuke@main"
+          pip install pytest
       - run: pytest -q tests
+      - name: The vendored hierarchy code matches rotobot-nuke
+        run: bash tools/check-vendored-hierarchy.sh

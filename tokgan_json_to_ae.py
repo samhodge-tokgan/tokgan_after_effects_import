@@ -36,8 +36,9 @@ instead (pass --flat for the single layer above):
 
 so an artist can stabilise, move a whole person, or adjust one limb without
 touching every vertex. The decomposition comes from rotobot-nuke's
-rotobot_nuke.hierarchy (pip install rotobot-nuke); the composed result is
-checked against every source vertex before anything is written.
+rotobot_nuke.hierarchy, vendored beside this script as _rotobot_hierarchy/
+(nothing to install); the composed result is checked against every source
+vertex before anything is written.
 
 Use `python3 tokgan_json_to_ae.py --help` for invocation details.
 
@@ -236,21 +237,41 @@ def _r(v, nd=3):
     return round(v, nd)
 
 
+def _hierarchy_api():
+    """(load_json, hierarchy module) for the v3 decomposition.
+
+    The vendored copy beside this script first (_rotobot_hierarchy/, a
+    byte-for-byte copy of rotobot-nuke's reader + hierarchy at the commit in
+    its VENDORED.txt), so the import needs nothing installed and always uses
+    the tested version; an installed rotobot-nuke otherwise.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        from _rotobot_hierarchy import hierarchy, reader
+        return reader.load_json, hierarchy
+    except ImportError:
+        pass
+    try:
+        from rotobot_nuke import hierarchy, load_json
+        return load_json, hierarchy
+    except ImportError:
+        raise SystemExit(
+            "This JSON has camera/person data (schema v3), and the hierarchy "
+            "code is missing: keep the _rotobot_hierarchy folder next to "
+            "tokgan_json_to_ae.py (or pip install rotobot-nuke), or pass "
+            "--flat for the single-layer import.")
+
+
 def build_hierarchy_payload(in_path, data, keep_names, person_color,
                             width, height, fps, start_frame, end_frame):
     """Payload for the hierarchy loader: camera corner pin, person Nulls and
-    bone-local shape layers. Raises SystemExit with a fix when rotobot-nuke
-    is missing or the decomposition does not reproduce the source."""
-    try:
-        from rotobot_nuke import load_json
-        from rotobot_nuke.hierarchy import (
-            ROUND_TRIP_TOLERANCE_PX, apply_h, decompose, round_trip_error)
-    except ImportError:
-        raise SystemExit(
-            "This JSON has camera/person data (schema v3). Building the AE "
-            "hierarchy needs rotobot-nuke:\n"
-            "    pip install rotobot-nuke\n"
-            "or pass --flat for the single-layer import.")
+    bone-local shape layers. Raises SystemExit with a fix when the hierarchy
+    code is missing or the decomposition does not reproduce the source."""
+    load_json, hier = _hierarchy_api()
+    ROUND_TRIP_TOLERANCE_PX = hier.ROUND_TRIP_TOLERANCE_PX
+    apply_h, decompose, round_trip_error = hier.apply_h, hier.decompose, hier.round_trip_error
 
     doc = load_json(in_path)
     doc.objects = {k: o for k, o in doc.objects.items() if k in keep_names}

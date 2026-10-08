@@ -59,9 +59,11 @@ main comp
   converter reports how many frames were held.
 * Before writing anything the converter recomposes every vertex through
   the hierarchy and refuses if any lands more than 0.05 px from the source.
-  The decomposition comes from
+  The decomposition is
   [`rotobot-nuke`](https://github.com/samhodge-tokgan/rotobot-nuke)'s
-  `rotobot_nuke.hierarchy`, shared with the Nuke and Silhouette importers.
+  `rotobot_nuke.hierarchy`, shared with the Nuke and Silhouette importers and
+  vendored here as `_rotobot_hierarchy/`
+  (`tools/check-vendored-hierarchy.sh` checks it against the pinned commit).
 
 Position, rotation and Corner Pin keys are linear, so a JSON thinned with
 `rotobot-undersample` (below) interpolates the way its error metric
@@ -94,10 +96,10 @@ The pre-pass is optional — direct conversion still works unchanged.
 
 ## Requirements
 
-* Python 3.9+. Standard library only for v2 / `--flat`; a v3 hierarchy
-  import also needs `pip install rotobot-nuke` (until it is on PyPI:
-  `pip install git+https://github.com/samhodge-tokgan/rotobot-nuke`).
-  Without it the converter says so and suggests `--flat`.
+* Python 3.9+, standard library only — nothing to install. The v3
+  hierarchy code is vendored beside the script in `_rotobot_hierarchy/`
+  (from [rotobot-nuke](https://github.com/samhodge-tokgan/rotobot-nuke), MIT);
+  keep that folder next to `tokgan_json_to_ae.py`.
 * After Effects 2024+ (tested on AE 25.6 / Mac).
 * The AE preference **Allow Scripts to Write Files and Access Network**
   must be enabled — `Settings > Scripting & Expressions`. Without it the
