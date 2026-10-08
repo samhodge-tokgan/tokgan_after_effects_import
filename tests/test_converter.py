@@ -92,21 +92,32 @@ class TestHierarchyPayload:
         bottom = (lr[0] - ll[0], lr[1] - ll[1])
         assert abs(top[0] - bottom[0]) > 1.0 or abs(top[1] - bottom[1]) > 1.0
 
-    def test_missing_rotobot_nuke_explains_the_fix(self, monkeypatch, tmp_path):
+    @staticmethod
+    def _block(monkeypatch, *prefixes):
         real_import = builtins.__import__
 
-        def no_rotobot(name, *a, **k):
-            if name.startswith("rotobot_nuke"):
+        def blocked(name, *a, **k):
+            if name.startswith(prefixes):
                 raise ImportError(name)
             return real_import(name, *a, **k)
 
-        monkeypatch.setattr(builtins, "__import__", no_rotobot)
+        monkeypatch.setattr(builtins, "__import__", blocked)
+
+    def _payload(self):
         data = json.loads((FIXTURES / "v3_real_cut.json").read_text())
+        return conv.build_hierarchy_payload(
+            str(FIXTURES / "v3_real_cut.json"), data, set(data["objects"]),
+            {0: [1, 0, 0]}, 3840, 2160, 24.0, 1, 24)
+
+    def test_vendored_copy_needs_nothing_installed(self, monkeypatch):
+        self._block(monkeypatch, "rotobot_nuke")
+        assert self._payload()["mode"] == "hierarchy"
+
+    def test_missing_hierarchy_code_explains_the_fix(self, monkeypatch):
+        self._block(monkeypatch, "rotobot_nuke", "_rotobot_hierarchy")
         with pytest.raises(SystemExit) as e:
-            conv.build_hierarchy_payload(
-                str(FIXTURES / "v3_real_cut.json"), data, set(data["objects"]),
-                {0: [1, 0, 0]}, 3840, 2160, 24.0, 1, 24)
-        assert "pip install rotobot-nuke" in str(e.value)
+            self._payload()
+        assert "_rotobot_hierarchy" in str(e.value)
         assert "--flat" in str(e.value)
 
 

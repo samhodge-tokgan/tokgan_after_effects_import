@@ -1,0 +1,5 @@
+# Byte-for-byte copies; do not edit here. Change rotobot-nuke, then re-vendor:
+#   packaging/ci/check-vendored-hierarchy.sh --update <new commit>
+repo    https://github.com/samhodge-tokgan/rotobot-nuke
+commit  f99c1ef83beb4b9ff41b8f316958b41df503db3f
+files   src/rotobot_nuke/reader.py src/rotobot_nuke/hierarchy.py LICENSE
