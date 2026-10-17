@@ -163,7 +163,11 @@ for (const sl of pre._layers.filter(l => l.kind === "shape")) {
     shp.vertices.forEach((v, i) => {
       const lv = rot(v[0] - anchor[0], v[1] - anchor[1], ang);
       const inPre = [npos[0] - nanc[0] + pos[0] + lv[0], npos[1] - nanc[1] + pos[1] + lv[1]];
-      const [px, py] = applyH(H, inPre[0], inPre[1]);
+      const [hx, hy] = applyH(H, inPre[0], inPre[1]);
+      // the precomp layer's own transform, then AE comp space -> JSON pixel space: the JSON names pixel
+      // CENTRES, AE's (0, 0) is the first pixel's top-left CORNER, so comp = json + 0.5
+      const pa = pinLayer.transform.anchorPoint.value, pp = pinLayer.transform.position.valueAt(t);
+      const px = hx - pa[0] + pp[0] - 0.5, py = hy - pa[1] + pp[1] - 0.5;
       worst = Math.max(worst, Math.hypot(px - pts[i].x, py - pts[i].y));
       checked++;
     });

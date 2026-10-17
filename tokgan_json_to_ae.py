@@ -539,10 +539,12 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         }}
 
         STEP = "layer-transform-and-motion-blur";
-        // Put the layer's origin at comp (0,0) so absolute pixel coords in
-        // the path data line up with comp coords (no half-resolution shift).
+        // Layer origin at comp (0.5, 0.5): the JSON's pixel coordinates name pixel CENTRES (as Silhouette,
+        // Nuke and the Kthanid matte read them), while AE's comp space puts (0, 0) at the top-left
+        // CORNER of the first pixel. At (0, 0) every shape rendered half a pixel up and left -- measured
+        // against the matte through AE 2025's own render (5362065, 2026-10-17).
         layer.transform.anchorPoint.setValue([0, 0]);
-        layer.transform.position.setValue([0, 0]);
+        layer.transform.position.setValue([0.5, 0.5]);
         layer.motionBlur = true;
 
         var tDone = ((new Date()).getTime() - tBuild) / 1000;
@@ -727,9 +729,11 @@ LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (ca
         STEP = "camera";
         var lay = comp.layers.add(pre);
         lay.name = "Tokgan Shapes";
-        // Layer space == comp space, so the Corner Pin points are plate pixels.
+        // Layer space == comp space, so the Corner Pin points are plate pixels -- placed at (0.5, 0.5)
+        // because those are pixel CENTRES and AE's (0, 0) is the first pixel's top-left corner (shapes
+        // otherwise render half a pixel up and left; measured through AE 2025's render, 2026-10-17).
         lay.transform.anchorPoint.setValue([0, 0]);
-        lay.transform.position.setValue([0, 0]);
+        lay.transform.position.setValue([0.5, 0.5]);
         lay.motionBlur = true;
         var pin = lay.property("ADBE Effect Parade").addProperty("ADBE Corner Pin");
         var ct = scaled(data.camera.times);
