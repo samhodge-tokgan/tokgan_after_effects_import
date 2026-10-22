@@ -18,9 +18,25 @@ In AE:
 The loader builds ONE shape layer ("Tokgan Shapes") containing one Vector
 Group per source object. Each group has a Bezier path animated frame-by-frame
 plus a hold-stepped opacity track driven by which source frames the object
-exists in. The loader retimes all keys to the active comp's frame rate so
-each source frame lands on one comp frame regardless of the JSON's declared
-fps. Motion blur is enabled on the layer.
+exists in. Motion blur is enabled on the layer.
+
+Timing: comp time 0 is the clip's FIRST frame (JSON frame "1"), for every
+layer, whether or not anybody is in it yet (it used to be the first
+frame with a person in it, so someone entering at frame 30 was keyed 29
+frames early). A comp the loader creates runs at the JSON's fps. Older JSONs
+stamped every file fps=24 whatever the footage ran at, so for those (no
+`frame_start`, fps 24, no --fps) the loader still retimes the keys to the
+active comp's frame rate, one source frame per comp frame, as it always has.
+A JSON that carries `frame_start` (or any fps but 24) declares the real rate:
+its keys go at their real times, and the loader says so when the active comp
+runs at another rate. `frame_start` (the plate's own number for JSON frame 1,
+e.g. 1001 or 977) also becomes the comp's displayStartFrame, so the timeline
+reads in the plate's numbers.
+
+--masks builds the AE-native "Solid + masks" layout instead: one solid
+per person, one Add mask per body part, its Mask Path keyed per frame and its
+Mask Opacity hold-stepped 0/100 for visibility. Much cheaper for After Effects
+to build and evaluate than hundreds of keyed shape-layer groups. Flat only.
 
 v3 JSONs (camera + persons blocks, Rotobot Next 0.10.0+) build a HIERARCHY
 instead (pass --flat for the single layer above):
@@ -65,7 +81,18 @@ BACKGROUND_DIM_DIVISOR = 20
 # would have to handle. Sidecars whose stored value differs from this
 # constant are rebuilt on the next run regardless of mtime, so older
 # sidecars without `color` don't quietly stay around.
-PAYLOAD_SCHEMA = 3
+PAYLOAD_SCHEMA = 4  # 4: retime / frame_start, clip-start time zero, masks mode
+
+# The layouts --masks / layout= choose between. "shapes" is the shape-layer
+# import (hierarchy for v3, else one flat layer); "masks" is Solid + masks.
+LAYOUTS = ("shapes", "masks")
+
+# JSON pixel coordinates name pixel CENTRES; AE comp space puts (0, 0) at the
+# first pixel's top-left CORNER. The shape loaders move their top layer to
+# (0.5, 0.5); the masks loader bakes the same half pixel into every vertex
+# instead, because moving a comp-sized solid would leave a half-pixel strip
+# at the top and left edge that no mask can cover.
+PIXEL_CENTRE = 0.5
 
 # Hierarchy mode: the stabilised precomp is padded this far beyond the
 # stabilised extent of every vertex, and must stay within AE's comp limit.
@@ -372,9 +399,60 @@ def build_hierarchy_payload(in_path, data, keep_names, person_color,
     }
 
 
+# ExtendScript shared by all three loaders, pasted into each (a loader is one
+# self-contained .jsx). Plain ES3: no let/const, no arrow functions. Braces are
+# literal here: it is substituted INTO the templates, never formatted itself.
+COMMON_JS = r"""
+        // How to turn the sidecar's times (seconds from the clip's first
+        // frame, at data.fps) into this comp's times.
+        //
+        // data.retime (older JSONs, which stamped every file fps=24 whatever
+        // the footage ran at): scale so each source frame lands on one comp
+        // frame, the long-standing behaviour. Otherwise data.fps is the
+        // plate's real rate, so the keys stay at their real times -- where
+        // the plate's own frames are in a comp of any rate -- and when this
+        // comp runs at another rate the operator is told rather than
+        // silently re-timed. A sidecar from before `retime` existed is old,
+        // so it is retimed.
+        function tokganTiming(comp, data) {
+            if (data.retime !== false) {
+                return { scale: data.fps / comp.frameRate, note: "" };
+            }
+            var note = "";
+            if (Math.abs(comp.frameRate - data.fps) > 0.001) {
+                note = "This clip runs at " + data.fps + " fps; the comp \"" + comp.name +
+                       "\" runs at " + comp.frameRate + " fps. The keys are at the clip's own " +
+                       "times, so some fall between this comp's frames. Set the comp to " +
+                       data.fps + " fps (Composition > Composition Settings) for one key per frame.";
+            }
+            return { scale: 1, note: note };
+        }
+
+        // The plate's own frame numbers on the timeline (1001, 977...): time 0
+        // stays the clip's first frame, only the display changes. Left alone
+        // when the JSON does not say (data.frame_start absent). displayStartFrame
+        // is AE 17.1+; earlier builds only have displayStartTime, in seconds.
+        function tokganDisplayStart(comp, data) {
+            if (data.frame_start === undefined || data.frame_start === null) return;
+            try {
+                if (typeof comp.displayStartFrame === "number") {
+                    comp.displayStartFrame = data.frame_start;
+                } else {
+                    comp.displayStartTime = data.frame_start / comp.frameRate;
+                }
+            } catch (eDs) {
+                $.writeln("[Tokgan] could not set the display start frame: " + eDs.toString());
+            }
+        }
+"""
+
+assert COMMON_JS.isascii(), "COMMON_JS must be pure ASCII"
+
+
 LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
 // Sidecar JSON ({data_basename}) is expected next to this script.
 (function() {{
+{common}
     var STEP = "init";
     try {{
         STEP = "locate-script";
@@ -446,6 +524,8 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             );
         }}
         comp.motionBlur = true;
+        tokganDisplayStart(comp, data);
+        var timing = tokganTiming(comp, data);
         var tBuild = (new Date()).getTime();
 
         function mkShape(v, i, o, c) {{
@@ -477,10 +557,9 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         layer.name = "Tokgan Shapes";
         var root = layer.property("ADBE Root Vectors Group");
 
-        // Re-time keys to the *comp's* frame rate so each source frame
-        // lands on one comp frame, regardless of the fps the JSON declared.
-        // (Common when the JSON metadata fps disagrees with the comp.)
-        var fpsScale = data.fps / comp.frameRate;
+        // Sidecar seconds -> comp seconds: 1 when the JSON's fps is real,
+        // else re-timed to one source frame per comp frame (tokganTiming).
+        var fpsScale = timing.scale;
         $.writeln("[Tokgan] data fps=" + data.fps + " comp fps=" + comp.frameRate + " scale=" + fpsScale);
 
         STEP = "build-groups";
@@ -555,6 +634,10 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             "JSON parse " + tParse.toFixed(2) + "s; " +
             "AE build " + tDone.toFixed(2) + "s"
         );
+        if (timing.note) {{
+            $.writeln("[Tokgan] " + timing.note);
+            alert("Tokgan import: " + timing.note);
+        }}
     }} catch (err) {{
         try {{ app.endUndoGroup(); }} catch (e2) {{}}
         alert(
@@ -580,6 +663,7 @@ assert LOADER_TEMPLATE.isascii(), "LOADER_TEMPLATE must be pure ASCII"
 LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (camera / person hierarchy).
 // Sidecar JSON (__DATA_BASENAME__) is expected next to this script.
 (function() {
+__COMMON__
     var STEP = "init";
     try {
         STEP = "find-sidecar";
@@ -621,7 +705,9 @@ LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (ca
                                              data.duration, data.fps);
         }
         comp.motionBlur = true;
-        var fpsScale = data.fps / comp.frameRate;
+        tokganDisplayStart(comp, data);
+        var timing = tokganTiming(comp, data);
+        var fpsScale = timing.scale;
 
         // Re-runs replace cleanly: the layer in this comp, then the precomp.
         for (var rl = comp.numLayers; rl >= 1; rl--) {
@@ -665,6 +751,8 @@ LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (ca
         var pre = app.project.items.addComp("Tokgan Stabilised", data.precomp.width,
                                             data.precomp.height, 1, comp.duration, comp.frameRate);
         pre.motionBlur = true;
+        // Same numbering inside, so a frame number reads the same in both.
+        tokganDisplayStart(pre, data);
 
         STEP = "persons";
         var nulls = {};
@@ -749,6 +837,10 @@ LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (ca
         app.endUndoGroup();
         $.writeln("[Tokgan hierarchy] " + data.persons.length + " persons, " +
                   data.shapes.length + " parts, " + data.camera.times.length + " camera keys");
+        if (timing.note) {
+            $.writeln("[Tokgan] " + timing.note);
+            alert("Tokgan import: " + timing.note);
+        }
     } catch (err) {
         try { app.endUndoGroup(); } catch (e2) {}
         alert("Tokgan import failed.\nStep: " + STEP + "\nError: " + err.toString() +
@@ -760,22 +852,230 @@ LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (ca
 assert LOADER_HIER_TEMPLATE.isascii(), "LOADER_HIER_TEMPLATE must be pure ASCII"
 
 
+# Solid + masks loader. One solid per person, one Add mask per body
+# part. Asked for because the shape-layer import is slow on dense clips, and
+# solid + masks is what AE riggers expect. Mask Path keys go in with ONE
+# setValuesAtTimes per mask and no per-key fallback: the fallback is what made
+# the shape path slow when it fired, and the sidecar is validated in Python
+# before it is written, so a refusal here is a real error to report.
+# Same substitution rules as LOADER_HIER_TEMPLATE.
+LOADER_MASKS_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (Solid + masks).
+// Sidecar JSON (__DATA_BASENAME__) is expected next to this script.
+(function() {
+__COMMON__
+    var STEP = "init";
+    try {
+        STEP = "find-sidecar";
+        var expectedName = "__DATA_BASENAME__";
+        var siblings = (new File($.fileName)).parent.getFiles();
+        var dataFile = null;
+        for (var fi = 0; fi < siblings.length; fi++) {
+            if (siblings[fi] instanceof File && siblings[fi].displayName === expectedName) {
+                dataFile = siblings[fi];
+                break;
+            }
+        }
+        if (!dataFile) {
+            dataFile = File.openDialog(
+                "Locate sidecar: " + expectedName +
+                " (generated by tokgan_json_to_ae.py, NOT the raw Tokgan JSON)");
+            if (!dataFile) return;
+        }
+
+        STEP = "read-sidecar (" + dataFile.fsName + ")";
+        dataFile.encoding = "UTF-8";
+        if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
+        var raw = dataFile.read();
+        dataFile.close();
+
+        STEP = "json-parse (" + raw.length + " chars)";
+        var t0 = (new Date()).getTime();
+        var data = (typeof JSON !== "undefined" && JSON.parse) ? JSON.parse(raw) : eval("(" + raw + ")");
+        var tParse = ((new Date()).getTime() - t0) / 1000;
+        if (data.mode !== "masks" || !data.solids) {
+            throw new Error(dataFile.displayName + " is not a Tokgan Solid + masks sidecar; " +
+                            "re-run tokgan_json_to_ae.py --masks on the raw JSON.");
+        }
+
+        app.beginUndoGroup("Import Tokgan Masks");
+
+        STEP = "init-comp";
+        var comp = app.project.activeItem;
+        if (!(comp instanceof CompItem)) {
+            comp = app.project.items.addComp("TokganShapes", data.width, data.height, 1,
+                                             data.duration, data.fps);
+        }
+        comp.motionBlur = true;
+        tokganDisplayStart(comp, data);
+        var timing = tokganTiming(comp, data);
+        var tBuild = (new Date()).getTime();
+
+        // Re-runs replace cleanly: every solid this loader made is named
+        // "Tokgan Masks ...". (The old solids' footage stays in the Solids
+        // folder, as AE leaves it for any deleted solid layer.)
+        for (var rl = comp.numLayers; rl >= 1; rl--) {
+            if (comp.layer(rl).name.indexOf("Tokgan Masks") === 0) comp.layer(rl).remove();
+        }
+
+        function scaled(times) {
+            var out = new Array(times.length);
+            for (var i = 0; i < times.length; i++) out[i] = times[i] * timing.scale;
+            return out;
+        }
+        function mkShape(v, i, o, c) {
+            var s = new Shape();
+            s.vertices = v; s.inTangents = i; s.outTangents = o; s.closed = c;
+            return s;
+        }
+
+        var nMasks = 0;
+        // Last person first: addSolid puts each new layer on top, so the
+        // first person ends up as the top layer, as in the other layouts.
+        for (var p = data.solids.length - 1; p >= 0; p--) {
+            var sd = data.solids[p];
+            STEP = "solid " + sd.name;
+            // Comp-sized and at the comp's centre (addSolid's default), so
+            // layer space == comp space; the half-pixel centre is already in
+            // the vertices.
+            var layer = comp.layers.addSolid(sd.color, sd.name, data.width, data.height, 1,
+                                             comp.duration);
+            layer.motionBlur = true;
+
+            for (var m = 0; m < sd.masks.length; m++) {
+                var md = sd.masks[m];
+                STEP = "mask " + (m + 1) + "/" + sd.masks.length + " (" + md.name + ")";
+                // AE 25.6 invalidates earlier property references when the
+                // parent changes, so re-acquire the new mask by index.
+                var parade = layer.property("ADBE Mask Parade");
+                parade.addProperty("ADBE Mask Atom");
+                var mask = parade.property(parade.numProperties);
+                mask.name = md.name;
+                mask.maskMode = MaskMode.ADD;
+                mask.property("ADBE Mask Feather").setValue([0, 0]);
+
+                var shapesAt = new Array(md.times.length);
+                for (var i = 0; i < md.times.length; i++) {
+                    shapesAt[i] = mkShape(md.verts[i], md.inT[i], md.outT[i], md.closed);
+                }
+                mask.property("ADBE Mask Shape").setValuesAtTimes(scaled(md.times), shapesAt);
+
+                // Visibility: Mask Opacity 0/100, held, so a part that is
+                // not in a frame adds nothing to the solid's alpha there.
+                if (md.opacity.length > 0) {
+                    var op = mask.property("ADBE Mask Opacity");
+                    var ot = new Array(md.opacity.length), ov = new Array(md.opacity.length);
+                    for (var q = 0; q < md.opacity.length; q++) {
+                        ot[q] = md.opacity[q][0] * timing.scale;
+                        ov[q] = md.opacity[q][1];
+                    }
+                    op.setValuesAtTimes(ot, ov);
+                    for (var k = 1; k <= op.numKeys; k++) {
+                        op.setInterpolationTypeAtKey(k, KeyframeInterpolationType.HOLD,
+                                                     KeyframeInterpolationType.HOLD);
+                    }
+                }
+                nMasks++;
+            }
+        }
+
+        var tDone = ((new Date()).getTime() - tBuild) / 1000;
+        app.endUndoGroup();
+        $.writeln("[Tokgan masks] " + data.solids.length + " solids, " + nMasks + " masks; " +
+                  "JSON parse " + tParse.toFixed(2) + "s; AE build " + tDone.toFixed(2) + "s");
+        if (timing.note) {
+            $.writeln("[Tokgan] " + timing.note);
+            alert("Tokgan import: " + timing.note);
+        }
+    } catch (err) {
+        try { app.endUndoGroup(); } catch (e2) {}
+        alert("Tokgan import failed.\nStep: " + STEP + "\nError: " + err.toString() +
+              "\nLine:  " + (err.line || "?"));
+    }
+})();
+"""
+
+assert LOADER_MASKS_TEMPLATE.isascii(), "LOADER_MASKS_TEMPLATE must be pure ASCII"
+
+
+def build_masks_payload(data, keep_names, person_color, width, height, fps,
+                        start_frame, end_frame):
+    """Payload for the Solid + masks loader: one solid per person (in person
+    id order), one mask record per body part with the half-pixel centre
+    baked into its vertices (PIXEL_CENTRE). Raises SystemExit when a record
+    is malformed, because the loader has no per-key fallback to hide it."""
+    by_pid = {}
+    for obj_name in keep_names:
+        obj = data["objects"][obj_name]
+        rec = build_shape_record(obj_name, obj, height, start_frame, end_frame, fps)
+        if not rec:
+            continue
+        rec["verts"] = [[[round(x + PIXEL_CENTRE, 2), round(y + PIXEL_CENTRE, 2)] for x, y in vs]
+                        for vs in rec["verts"]]
+        for i, vs in enumerate(rec["verts"]):
+            if not (len(vs) == len(rec["inT"][i]) == len(rec["outT"][i])) or not vs:
+                raise SystemExit(
+                    "%s: key %d has %d vertices, %d in- and %d out-tangents"
+                    % (obj_name, i + 1, len(vs), len(rec["inT"][i]), len(rec["outT"][i])))
+        by_pid.setdefault(person_id_of(obj_name, obj), []).append(rec)
+    solids = [{"pid": pid, "name": "Tokgan Masks p%d" % pid,
+               "color": person_color[pid], "masks": masks}
+              for pid, masks in sorted(by_pid.items())]
+    return {
+        "schema": PAYLOAD_SCHEMA,
+        "mode": "masks",
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "duration": (end_frame - start_frame + 1) / fps,
+        "solids": solids,
+    }
+
+
 class ConvertResult(NamedTuple):
     jsx: str          # the loader to run in After Effects
     data: str         # its sidecar, which must stay next to it
-    mode: str         # "hierarchy" or "flat"
+    mode: str         # "hierarchy", "flat" or "masks"
     shapes: object    # shape/part count, or "?" when a cached sidecar was reused
     held: list        # hierarchy notes for missing/failed tracking that was held
 
 
-def convert(in_path_arg, out_jsx_arg=None, *, flat=False, keep_background=False,
-            fps_override=None, force=False, log=print):
+def _frame_start(data):
+    """The JSON's `frame_start` (the plate's number for JSON frame 1), or None
+    when it is absent or not a whole number >= 0."""
+    v = data.get("frame_start")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 or v != int(v):
+        return None
+    return int(v)
+
+
+def _clip_frames(data):
+    """Every JSON frame key the clip mentions: object frames and visibility,
+    plus the camera and persons blocks of a v3 JSON. Their max is the last
+    frame of the clip as far as this file can tell; the first is always 1."""
+    frames = set()
+    for obj in data["objects"].values():
+        frames.update(int(k) for k in obj.get("frames", {}))
+        frames.update(int(k) for k in obj.get("visibility", {}))
+    for block in ("camera", "persons"):
+        if isinstance(data.get(block), dict):
+            frames.update(int(k) for k in data[block] if str(k).lstrip("-").isdigit())
+    return frames
+
+
+def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
+            keep_background=False, fps_override=None, force=False, log=print):
     """Write the AE loader (.jsx) and its sidecar for one shape JSON.
+
+    `layout="masks"` writes the Solid + masks loader (always flat);
+    "shapes" (the default) the shape-layer one, a hierarchy for a v3 JSON
+    unless `flat`.
 
     The command line is a thin wrapper around this; Rotobot Queue calls it
     directly. `log` receives the same progress lines the CLI prints.
     """
-    requested = "flat" if flat else "auto"
+    if layout not in LAYOUTS:
+        raise ValueError("layout must be one of %s, not %r" % (", ".join(LAYOUTS), layout))
+    requested = "masks" if layout == "masks" else ("flat" if flat else "auto")
 
     in_path = in_path_arg
     out_jsx = out_jsx_arg or os.path.splitext(in_path)[0] + ".jsx"
@@ -827,12 +1127,21 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, keep_background=False,
         fps = float(fps_override) if fps_override else json_fps
         if fps_override and fps_override != json_fps:
             log(f"  fps override: JSON says {json_fps}, using {fps}")
+        frame_start = _frame_start(data)
+        # Is the fps real? Before frame_start existed the engine stamped every
+        # JSON fps=24 whatever the plate ran at, so a plain 24 with no
+        # frame_start could be anything, and the loader keeps retiming those
+        # to one source frame per comp frame. frame_start, any other fps, or
+        # an explicit --fps is a real rate, keyed at its real times.
+        retime = frame_start is None and json_fps == 24 and not fps_override
 
-        all_frames = set()
-        for obj in data["objects"].values():
-            for fkey in obj.get("frames", {}).keys():
-                all_frames.add(int(fkey))
-        start_frame = min(all_frames) if all_frames else 1
+        # Time zero is the clip's first frame, JSON frame 1, for every layer.
+        # It used to be min() of the frames with shapes in them, which keyed
+        # a person who entered at frame 30 twenty-nine frames early against
+        # the plate -- Silhouette and Nuke key by absolute frame and never
+        # were. min(1, ...) only matters to a hand-made JSON keyed from 0.
+        all_frames = _clip_frames(data)
+        start_frame = min([1] + list(all_frames))
         end_frame = max(all_frames) if all_frames else 48
         n_frames = end_frame - start_frame + 1
         duration = n_frames / fps
@@ -847,9 +1156,19 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, keep_background=False,
             if keep_background or person_id_of(name, obj) not in bg_set
         ]
         has_v3 = bool(data.get("camera") or data.get("persons"))
-        mode = "hierarchy" if (has_v3 and not flat) else "flat"
+        if layout == "masks":
+            mode = "masks"
+        else:
+            mode = "hierarchy" if (has_v3 and not flat) else "flat"
 
-        if mode == "hierarchy":
+        if mode == "masks":
+            payload = build_masks_payload(data, keep_names, person_color, width,
+                                          height, fps, start_frame, end_frame)
+            shapes = [m for sd in payload["solids"] for m in sd["masks"]]
+            summary_extra += (
+                f"  Solid + masks: {len(payload['solids'])} solid(s), "
+                f"{len(shapes)} masks\n")
+        elif mode == "hierarchy":
             payload = build_hierarchy_payload(
                 in_path, data, set(keep_names), person_color,
                 width, height, fps, start_frame, end_frame)
@@ -882,6 +1201,9 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, keep_background=False,
                 "shapes": shapes,
             }
         payload["requested"] = requested
+        payload["retime"] = retime
+        if frame_start is not None:
+            payload["frame_start"] = frame_start
 
         with open(out_data, "w", encoding="utf-8", newline="\n") as f:
             json.dump(payload, f, separators=(",", ":"))
@@ -901,9 +1223,14 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, keep_background=False,
                 )
 
     if mode == "hierarchy":
-        loader = LOADER_HIER_TEMPLATE.replace("__DATA_BASENAME__", os.path.basename(out_data))
+        loader = (LOADER_HIER_TEMPLATE.replace("__DATA_BASENAME__", os.path.basename(out_data))
+                  .replace("__COMMON__", COMMON_JS))
+    elif mode == "masks":
+        loader = (LOADER_MASKS_TEMPLATE.replace("__DATA_BASENAME__", os.path.basename(out_data))
+                  .replace("__COMMON__", COMMON_JS))
     else:
-        loader = LOADER_TEMPLATE.format(data_basename=os.path.basename(out_data))
+        loader = LOADER_TEMPLATE.format(data_basename=os.path.basename(out_data),
+                                        common=COMMON_JS)
     with open(out_jsx, "w", encoding="utf-8", newline="\n") as f:
         f.write(loader)
 
@@ -927,11 +1254,16 @@ def main():
             ".jsx in AE via File > Scripts > Run Script File... A v2 JSON "
             "builds one shape layer holding an animated Bezier path per "
             "object; a v3 JSON (camera + person data) builds a camera Corner "
-            "Pin, a Null per person and a shape layer per body part."
+            "Pin, a Null per person and a shape layer per body part. --masks "
+            "builds one solid per person with a mask per body part instead."
         ),
         epilog=(
-            "Notes: each source frame lands on one comp frame regardless of "
-            "the JSON's declared fps. Enable 'Allow Scripts to Write Files "
+            "Notes: comp time 0 is the clip's first frame. A comp the loader "
+            "creates runs at the JSON's fps; when the JSON has frame_start, "
+            "the comp's timeline is numbered from it. A JSON without "
+            "frame_start that says 24 fps (every file before v0.20) is "
+            "retimed to one source frame per comp frame. Enable 'Allow "
+            "Scripts to Write Files "
             "and Access Network' in AE's preferences (Scripting & "
             "Expressions) before running the loader."
         ),
@@ -982,8 +1314,19 @@ def main():
             "camera / person / body-part hierarchy)."
         ),
     )
+    p.add_argument(
+        "--masks",
+        action="store_true",
+        help=(
+            "Solid + masks: one solid per person and one Add mask per body "
+            "part, its Mask Path keyed per frame and its Mask Opacity held "
+            "0/100 for visibility. Faster to import than shape layers on "
+            "dense clips. Always flat (no camera / person hierarchy)."
+        ),
+    )
     args = p.parse_args()
     convert(args.input, args.output, flat=args.flat,
+            layout="masks" if args.masks else "shapes",
             keep_background=args.keep_background, fps_override=args.fps,
             force=args.force)
 
