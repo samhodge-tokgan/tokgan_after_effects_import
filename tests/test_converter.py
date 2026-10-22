@@ -56,7 +56,10 @@ class TestModes:
 
     def test_flat_loader_is_unchanged_by_the_hierarchy_work(self, tmp_path):
         _, jsx, _, _ = run(tmp_path, "v2_cut.json")
-        assert jsx.read_text() == conv.LOADER_TEMPLATE.format(data_basename="clip_data.json")
+        # The flat loader is the template with the sidecar name and the timing code
+        # shared by every loader (Rotobot Next v0.20: time zero is the clip's first frame).
+        assert jsx.read_text() == conv.LOADER_TEMPLATE.format(data_basename="clip_data.json",
+                                                             common=conv.COMMON_JS)
 
     def test_switching_mode_rebuilds_the_sidecar(self, tmp_path):
         run(tmp_path, "v3_real_cut.json")

@@ -2,4 +2,4 @@
 # Change them there, then re-sync (packaging/ci/sync-downstream-dcc.sh); Rotobot-Next CI fails if they
 # are edited here (packaging/ci/check-downstream-dcc-sync.sh).
 repo    https://github.com/samhodge-tokgan/Rotobot-Next
-commit  60904f8777c19966f8a30c1a8a4dabc244d6013a  (fix(after-effects): place shapes on pixel centres (they rendered half a pixel up and left) (#357))
+commit  fb5d75fee33bffe5adfa27a028f992beedf1c653  (chore(integrations): keep private issue numbers and host names out of the public DCC copies (#413))
