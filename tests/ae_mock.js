@@ -5,6 +5,11 @@
 //
 //   node tests/ae_mock.js <loader.jsx> <source.json>
 //
+// With AE_MOCK_ACTIVE_FPS set, the loader instead runs with an active comp at
+// that rate (the operator's own plate comp), and the run is reported -- the
+// comp comment, the progress palette, the log -- without recomposing.
+// alert() throws in both: a successful import must never open a dialog.
+//
 // This checks the loader's maths and the calls it makes, not After Effects
 // itself; the in-host check is still a person opening it in AE.
 "use strict";
@@ -97,23 +102,53 @@ const project = {
 };
 class FakeFile {
   constructor(p) { this.fsName = p; this.displayName = path.basename(p); }
-  get parent() { const d = path.dirname(this.fsName); return { getFiles: () => fs.readdirSync(d).map(n => new FakeFile(path.join(d, n))) }; }
-  open() { return true; } close() {} read() { return fs.readFileSync(this.fsName, "utf8"); }
+  get parent() { const d = path.dirname(this.fsName); return { fsName: d, getFiles: () => fs.readdirSync(d).map(n => new FakeFile(path.join(d, n))) }; }
+  get exists() { return fs.existsSync(this.fsName); }
+  get length() { return this.exists ? fs.statSync(this.fsName).size : -1; }
+  open(mode) {
+    this.mode = mode || "r";
+    if (this.mode === "w") fs.writeFileSync(this.fsName, "");
+    return this.mode !== "r" || this.exists;
+  }
+  close() {} read() { return fs.readFileSync(this.fsName, "utf8"); }
+  writeln(s) { fs.appendFileSync(this.fsName, s + "\n"); }
 }
 FakeFile.openDialog = () => null;
 class Shape {}
+// ScriptUI: a palette that records what it shows.
+const palettes = [];
+class Window {
+  constructor(type, title) { this.type = type; this.title = title; this.controls = []; this.shown = false; palettes.push(this); }
+  add(kind, bounds, text) { const c = { kind, text }; this.controls.push(c); return c; }
+  show() { this.shown = true; } update() {} close() { this.shown = false; }
+}
 
 const logs = [];
 const ctx = {
   $: { fileName: path.resolve(jsxPath), writeln: s => logs.push(s) },
-  File: FakeFile, Shape, CompItem,
-  app: { project, beginUndoGroup() {}, endUndoGroup() {} },
+  File: FakeFile, Shape, CompItem, Window,
+  app: { project, version: "mock", beginUndoGroup() {}, endUndoGroup() {} },
   PropertyValueType: { TwoD_SPATIAL: "TwoD_SPATIAL", ThreeD_SPATIAL: "ThreeD_SPATIAL" },
   KeyframeInterpolationType: { LINEAR: "LINEAR", HOLD: "HOLD" },
   alert: s => { throw new Error("loader alert: " + s); },
   JSON,
 };
+const activeFps = process.env.AE_MOCK_ACTIVE_FPS;
+if (activeFps) {
+  const plate = project.items.addComp("Plate", 3840, 2160, 1, 10, Number(activeFps));
+  plate.comment = "artist notes";
+  project.activeItem = plate;
+}
 vm.runInNewContext(fs.readFileSync(jsxPath, "utf8"), ctx);
+if (activeFps) {
+  const logPath = jsxPath.replace(/\.jsx$/i, "") + "_import.log";
+  console.log(JSON.stringify({
+    comment: project.activeItem.comment,
+    palette: palettes.map(w => ({ type: w.type, shown: w.shown, text: w.controls.filter(c => c.kind === "statictext").map(c => c.text) })),
+    log: fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : null,
+  }));
+  process.exit(0);
+}
 
 // ---------------------------------------------------------------- recompose
 const main = project._items.find(c => c.name === "TokganShapes");

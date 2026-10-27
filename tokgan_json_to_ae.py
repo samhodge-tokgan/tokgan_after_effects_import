@@ -56,6 +56,13 @@ rotobot_nuke.hierarchy, vendored beside this script as _rotobot_hierarchy/
 (nothing to install); the composed result is checked against every source
 vertex before anything is written.
 
+Every loader shows its progress in a non-modal palette and logs each step,
+timestamped, to <stem>_import.log next to the .jsx. Only a failure opens a
+dialog; a timing note (the comp runs at another fps) goes in the palette and
+the comp's comment. Path keys are capped at --max-cp control points (default
+96), resampled evenly along the curve, which keeps dense shapes quick to
+import.
+
 Use `python3 tokgan_json_to_ae.py --help` for invocation details.
 
 Coordinate convention:
@@ -65,6 +72,7 @@ Coordinate convention:
 """
 
 import colorsys
+import io
 import json
 import os
 import sys
@@ -101,9 +109,119 @@ AE_MAX_COMP_SIZE = 30000
 
 BACKGROUND_GREY = [0.5, 0.5, 0.5]
 
+# At most this many control points per path key (--max-cp; 0 = no cap). Every
+# point is keyed on every frame, so the sidecar, the loader's parse and AE's
+# keying all grow with it: dense 4K shapes reach ~180 points per key, and a
+# long shot then takes minutes to import. Shapes over the cap are resampled
+# evenly by arc length (resample_points); the source JSON is never touched.
+DEFAULT_MAX_CP = 96
+
+# Arc length is measured on each Bezier segment split this many times: plenty
+# for segments a few pixels long, and it keeps the cap cheap in plain Python.
+ARC_SUBDIV = 4
+
 
 def round_pt(x, y, ndigits=2):
     return [round(x, ndigits), round(y, ndigits)]
+
+
+def _bez(p0, p1, p2, p3, t):
+    """Point and derivative of the cubic p0..p3 at t, as (x, y, dx, dy)."""
+    u = 1.0 - t
+    a, b, c, d = u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t
+    da, db, dc, dd = -3 * u * u, 3 * u * u - 6 * u * t, 6 * u * t - 3 * t * t, 3 * t * t
+    return (a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0],
+            a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1],
+            da * p0[0] + db * p1[0] + dc * p2[0] + dd * p3[0],
+            da * p0[1] + db * p1[1] + dc * p2[1] + dd * p3[1])
+
+
+def resample_points(pts, closed, max_cp):
+    """`pts` (JSON point dicts: x, y and optional absolute left_/right_
+    handles) cut to `max_cp` knots spaced evenly by arc length along the
+    curve they draw, starting at the first knot. A closed shape wraps from
+    its last knot to its first, as build_shape_record keys it; an open one
+    keeps both ends. Handles lie along the curve's tangent, a third of the
+    neighbouring spacing long; a shape without handles stays a polygon.
+    Returns `pts` itself when it is already within the cap (or max_cp is 0)."""
+    n = len(pts)
+    if not max_cp or n <= max_cp or n < 3:
+        return pts
+    max_cp = max(max_cp, 3 if closed else 2)
+    smooth = any(("left_x" in p and (p["left_x"] != p["x"] or p["left_y"] != p["y"])) or
+                 ("right_x" in p and (p["right_x"] != p["x"] or p["right_y"] != p["y"]))
+                 for p in pts)
+
+    segs = []  # (p0, p1, p2, p3) per Bezier segment
+    for i in range(n if closed else n - 1):
+        a, b = pts[i], pts[(i + 1) % n]
+        p0, p3 = (a["x"], a["y"]), (b["x"], b["y"])
+        p1 = (a.get("right_x", p0[0]), a.get("right_y", p0[1]))
+        p2 = (b.get("left_x", p3[0]), b.get("left_y", p3[1]))
+        segs.append((p0, p1, p2, p3))
+
+    # Cumulative arc length at every subdivision: (length, segment, t).
+    table = [(0.0, 0, 0.0)]
+    total = 0.0
+    for si, (p0, p1, p2, p3) in enumerate(segs):
+        px, py = p0
+        for k in range(1, ARC_SUBDIV + 1):
+            t = k / ARC_SUBDIV
+            x, y, _, _ = _bez(p0, p1, p2, p3, t)
+            total += ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+            table.append((total, si, t))
+            px, py = x, y
+    if total <= 0.0:
+        return pts[:max_cp]
+
+    step = total / (max_cp if closed else max_cp - 1)
+    out = []
+    j = 0
+    for k in range(max_cp):
+        s = min(k * step, total)
+        while j + 1 < len(table) - 1 and table[j + 1][0] < s:
+            j += 1
+        (s0, si0, t0), (s1, si1, t1) = table[j], table[j + 1]
+        if si1 != si0:          # the end of segment si0 is t = 0 of si1
+            t0 = 0.0
+        f = (s - s0) / (s1 - s0) if s1 > s0 else 0.0
+        t = t0 + (t1 - t0) * f
+        x, y, dx, dy = _bez(*segs[si1], t)
+        rec = {"x": x, "y": y}
+        dl = (dx * dx + dy * dy) ** 0.5
+        if smooth and dl > 0.0:
+            h = step / 3.0 / dl
+            rec.update(left_x=x - dx * h, left_y=y - dy * h,
+                       right_x=x + dx * h, right_y=y + dy * h)
+        else:
+            rec.update(left_x=x, left_y=y, right_x=x, right_y=y)
+        out.append(rec)
+    if not closed:
+        # Exact ends, and no handle beyond them.
+        for rec, src in ((out[0], pts[0]), (out[-1], pts[-1])):
+            ox, oy = src["x"] - rec["x"], src["y"] - rec["y"]
+            for kx, ky in (("x", "y"), ("left_x", "left_y"), ("right_x", "right_y")):
+                rec[kx] += ox
+                rec[ky] += oy
+        out[0]["left_x"], out[0]["left_y"] = out[0]["x"], out[0]["y"]
+        out[-1]["right_x"], out[-1]["right_y"] = out[-1]["x"], out[-1]["y"]
+    return out
+
+
+def cap_control_points(data, max_cp):
+    """Resample every path key in the raw JSON `data` (in place) to at most
+    `max_cp` knots. Returns how many keys were resampled."""
+    if not max_cp:
+        return 0
+    n = 0
+    for obj in data["objects"].values():
+        closed = bool(obj.get("closed", True))
+        for fr in obj.get("frames", {}).values():
+            pts = fr.get("points") if isinstance(fr, dict) else None
+            if pts and len(pts) > max_cp:
+                fr["points"] = resample_points(pts, closed, max_cp)
+                n += 1
+    return n
 
 
 def person_id_of(obj_name, obj):
@@ -210,45 +328,24 @@ def build_shape_record(obj_name, obj, height, start_frame, end_frame, fps):
 
     # Opacity: drive 0 when the shape doesn't exist in a source frame, 100
     # when it does. The shape "exists" iff visibility[f]==1 (preferred) or
-    # iff f has path data (fallback when visibility is absent). Each visible
-    # segment emits four hold-stepped keys so AE shows a clean on/off step.
+    # iff f has path data (fallback when visibility is absent). The keys are
+    # held, so the minimal set is one at the clip's start and one wherever
+    # the value changes: a part that flickers costs two keys per gap, and
+    # one that is always there costs one.
     visibility = obj.get("visibility", {})
     if visibility:
-        exists = sorted(int(k) for k, v in visibility.items() if v)
+        exists = set(int(k) for k, v in visibility.items() if v)
     else:
-        exists = list(path_frames)
+        exists = set(path_frames)
 
     opacity = []
     if exists:
-        # Build contiguous segments
-        segments = []
-        s = exists[0]; e = exists[0]
-        for f in exists[1:]:
-            if f == e + 1:
-                e = f
-            else:
-                segments.append((s, e))
-                s, e = f, f
-        segments.append((s, e))
-
-        def _t(frame):
-            return round((frame - start_frame) / fps, 6)
-
-        raw = []
-        for seg_start, seg_end in segments:
-            if seg_start > start_frame:
-                raw.append((_t(seg_start - 1), 0))
-            raw.append((_t(seg_start), 100))
-            raw.append((_t(seg_end), 100))
-            if seg_end < end_frame:
-                raw.append((_t(seg_end + 1), 0))
-        if segments[0][0] > start_frame and not any(t == 0.0 for t, _ in raw):
-            raw.append((0.0, 0))
-
-        seen = {}
-        for t, v in raw:
-            seen[t] = v
-        opacity = [[t, v] for t, v in sorted(seen.items())]
+        last = None
+        for f in range(start_frame, end_frame + 1):
+            v = 100 if f in exists else 0
+            if v != last:
+                opacity.append([round((f - start_frame) / fps, 6), v])
+                last = v
 
     return {
         "name": obj_name,
@@ -301,6 +398,7 @@ def build_hierarchy_payload(in_path, data, keep_names, person_color,
     ROUND_TRIP_TOLERANCE_PX = hier.ROUND_TRIP_TOLERANCE_PX
     apply_h, decompose, round_trip_error = hier.apply_h, hier.decompose, hier.round_trip_error
 
+    # `in_path` is a path, or a text stream of the (control-point capped) JSON.
     doc = load_json(in_path)
     doc.objects = {k: o for k, o in doc.objects.items() if k in keep_names}
     hier = decompose(doc)
@@ -444,6 +542,147 @@ COMMON_JS = r"""
                 $.writeln("[Tokgan] could not set the display start frame: " + eDs.toString());
             }
         }
+
+        // Progress: a non-modal palette, and a log next to the .jsx
+        // (<stem>_import.log) with one timestamped line per STEP, so an import
+        // that seems stuck says where it is. Nothing on the success path is
+        // modal: a modal alert can open behind the host window on Windows, and
+        // After Effects then looks frozen. Only a failure gets a dialog. The
+        // palette and the log never stop an import: every call is wrapped, and
+        // one that cannot be made (no UI, a read-only folder) is left out.
+        function tokganPad(n) { return (n < 10 ? "0" : "") + n; }
+        function tokganStamp() {
+            var d = new Date();
+            return d.getFullYear() + "-" + tokganPad(d.getMonth() + 1) + "-" + tokganPad(d.getDate()) +
+                   " " + tokganPad(d.getHours()) + ":" + tokganPad(d.getMinutes()) + ":" +
+                   tokganPad(d.getSeconds());
+        }
+        function tokganElapsed(pr) { return ((new Date()).getTime() - pr.t0) / 1000; }
+        function tokganLog(pr, line) {
+            $.writeln("[Tokgan] " + line);
+            if (!pr.log) return;
+            try {
+                // Opened and closed per line, so the log is complete up to
+                // the moment After Effects stopped, whatever stopped it.
+                if (pr.log.open("a")) { pr.log.writeln(line); pr.log.close(); }
+            } catch (eLg) { pr.log = null; }
+        }
+        function tokganShow(pr, text) {
+            if (!pr.text) return;
+            try {
+                pr.text.text = text;
+                pr.win.update();
+            } catch (eSh) { pr.text = null; }
+        }
+        function tokganProgressOpen(title) {
+            var pr = { t0: (new Date()).getTime(), title: title, win: null, text: null, log: null };
+            try {
+                pr.log = new File((new File($.fileName)).fsName.replace(/\.jsx(bin)?$/i, "") + "_import.log");
+                pr.log.encoding = "UTF-8";
+                if (pr.log.open("w")) {
+                    pr.log.writeln("[" + tokganStamp() + "] " + title + ": " + $.fileName);
+                    pr.log.writeln("After Effects " + app.version + "; native JSON: " +
+                                   (typeof JSON !== "undefined" && JSON.parse ? "yes" : "no (eval)"));
+                    pr.log.close();
+                } else {
+                    pr.log = null;
+                }
+            } catch (eLo) { pr.log = null; }
+            try {
+                pr.win = new Window("palette", title, undefined, { resizeable: true });
+                pr.win.orientation = "column";
+                pr.win.alignChildren = ["fill", "top"];
+                pr.text = pr.win.add("statictext", undefined, "Starting...", { multiline: true });
+                pr.text.preferredSize = [520, 110];
+                // A Function built from source sees only the global scope. A
+                // closure here would keep the loader's scope -- the whole
+                // parsed sidecar -- alive for as long as the palette is open.
+                pr.win.add("button", undefined, "Close").onClick = new Function("this.window.close();");
+                pr.win.show();
+            } catch (eWi) { pr.win = null; pr.text = null; }
+            return pr;
+        }
+        // Record a STEP (with counts in its text) and return it for STEP.
+        function tokganStep(pr, step) {
+            var t = tokganElapsed(pr).toFixed(1);
+            tokganLog(pr, "[" + tokganStamp() + " +" + t + "s] " + step);
+            tokganShow(pr, pr.title + "\n" + step + "\n" + t + " s");
+            return step;
+        }
+        // The end of an import: the summary (and any note) stays in the
+        // palette until the operator closes it.
+        function tokganDone(pr, summary, note) {
+            var t = tokganElapsed(pr).toFixed(1);
+            tokganLog(pr, "[" + tokganStamp() + " +" + t + "s] done: " + summary + " in " + t + " s");
+            if (note) tokganLog(pr, "note: " + note);
+            tokganShow(pr, summary + " in " + t + " s" + (note ? "\n\n" + note : ""));
+        }
+        function tokganFailed(pr, step, err) {
+            var t = tokganElapsed(pr).toFixed(1);
+            tokganLog(pr, "[" + tokganStamp() + " +" + t + "s] FAILED at " + step + ": " + err.toString() +
+                          " (line " + (err.line || "?") + ")");
+            tokganShow(pr, "Import failed at: " + step + "\n" + err.toString());
+        }
+
+        // The timing note goes in the comp's comment (replacing an earlier
+        // import's), where it stays with the comp, rather than in a dialog.
+        function tokganCommentNote(comp, note) {
+            var PREFIX = "Tokgan import: ";
+            try {
+                var lines = String(comp.comment || "").split("\n"), keep = [];
+                for (var i = 0; i < lines.length; i++) {
+                    if (lines[i].indexOf(PREFIX) !== 0) keep.push(lines[i]);
+                }
+                while (keep.length && keep[keep.length - 1] === "") keep.pop();
+                if (note) keep.push(PREFIX + note);
+                comp.comment = keep.join("\n");
+            } catch (eCm) {
+                $.writeln("[Tokgan] could not set the comp comment: " + eCm.toString());
+            }
+        }
+
+        // The sidecar: by path first (no folder listing), then by listing
+        // the folder (robust to ':' and spaces in names), then by asking.
+        function tokganFindSidecar(expectedName) {
+            var folder = (new File($.fileName)).parent;
+            try {
+                var direct = new File(folder.fsName + "/" + expectedName);
+                if (direct.exists) return direct;
+            } catch (eDi) {}
+            var siblings = folder.getFiles();
+            for (var fi = 0; fi < siblings.length; fi++) {
+                if (siblings[fi] instanceof File && siblings[fi].displayName === expectedName) {
+                    return siblings[fi];
+                }
+            }
+            // The .jsx alone is useless: the sidecar must travel with it.
+            return File.openDialog(
+                "Locate sidecar: " + expectedName +
+                " (generated by tokgan_json_to_ae.py, NOT the raw Tokgan JSON)");
+        }
+
+        // Hold-stepped keys from [[seconds, value], ...] (visibility) in one
+        // call, then every key set to HOLD.
+        function tokganHeldKeys(prop, keys, scale) {
+            var ts = new Array(keys.length), vs = new Array(keys.length);
+            for (var i = 0; i < keys.length; i++) {
+                ts[i] = keys[i][0] * scale;
+                vs[i] = keys[i][1];
+            }
+            prop.setValuesAtTimes(ts, vs);
+            for (var k = 1; k <= prop.numKeys; k++) {
+                prop.setInterpolationTypeAtKey(k, KeyframeInterpolationType.HOLD,
+                                               KeyframeInterpolationType.HOLD);
+            }
+        }
+
+        // JSON.parse where the host has it; ExtendScript (After Effects 2025
+        // included) has no native JSON, so eval inside parens -- safe here
+        // because the sidecar is written by tokgan_json_to_ae.py.
+        function tokganParse(raw) {
+            if (typeof JSON !== "undefined" && JSON.parse) return JSON.parse(raw);
+            return eval("(" + raw + ")");
+        }
 """
 
 assert COMMON_JS.isascii(), "COMMON_JS must be pure ASCII"
@@ -454,35 +693,18 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
 (function() {{
 {common}
     var STEP = "init";
+    var prog = tokganProgressOpen("Tokgan import");
     try {{
-        STEP = "locate-script";
-        var scriptFile = new File($.fileName);
-        var parentDir = scriptFile.parent;
         var expectedName = "{data_basename}";
 
-        STEP = "find-sidecar";
-        // Use getFiles() to enumerate the directory rather than constructing
-        // a File from a path string -- robust to ':' / spaces in basenames.
-        var siblings = parentDir.getFiles();
-        var dataFile = null;
-        for (var fi = 0; fi < siblings.length; fi++) {{
-            var f = siblings[fi];
-            if (f instanceof File && f.displayName === expectedName) {{
-                dataFile = f;
-                break;
-            }}
-        }}
+        STEP = tokganStep(prog, "find-sidecar (" + expectedName + ")");
+        var dataFile = tokganFindSidecar(expectedName);
         if (!dataFile) {{
-            // Fallback: ask the user to pick it.
-            // The .jsx alone is useless: the sidecar must travel with it.
-            dataFile = File.openDialog(
-                "Locate sidecar: " + expectedName +
-                " (generated by tokgan_json_to_ae.py, NOT the raw Tokgan JSON)"
-            );
-            if (!dataFile) return;
+            tokganStep(prog, "cancelled: no sidecar");
+            return;
         }}
 
-        STEP = "read-sidecar (" + dataFile.fsName + ", " + dataFile.length + " bytes)";
+        STEP = tokganStep(prog, "read-sidecar (" + dataFile.fsName + ", " + dataFile.length + " bytes)");
         dataFile.encoding = "UTF-8";
         if (!dataFile.open("r")) {{
             throw new Error("File.open returned false for " + dataFile.fsName);
@@ -493,16 +715,10 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             throw new Error("File.read returned empty string");
         }}
 
-        STEP = "json-parse (" + raw.length + " chars)";
+        STEP = tokganStep(prog, "json-parse (" + raw.length + " chars)");
         var t0 = (new Date()).getTime();
-        var data;
-        if (typeof JSON !== "undefined" && JSON.parse) {{
-            data = JSON.parse(raw);
-        }} else {{
-            // Polyfill: JSON is valid JS; eval inside parens.
-            // Safe here because the data is produced by our own Python.
-            data = eval("(" + raw + ")");
-        }}
+        var data = tokganParse(raw);
+        raw = null;
         var tParse = ((new Date()).getTime() - t0) / 1000;
         if (!data.shapes || data.duration === undefined) {{
             throw new Error(
@@ -512,7 +728,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             );
         }}
 
-        STEP = "init-comp";
+        STEP = tokganStep(prog, "init-comp (parsed in " + tParse.toFixed(1) + " s)");
         app.beginUndoGroup("Import Tokgan Shapes");
 
         var comp = app.project.activeItem;
@@ -547,7 +763,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             }}
         }}
 
-        STEP = "create-shape-layer";
+        STEP = tokganStep(prog, "create-shape-layer");
         // Remove a previous "Tokgan Shapes" layer so re-runs replace cleanly.
         for (var rl = comp.numLayers; rl >= 1; rl--) {{
             if (comp.layer(rl).name === "Tokgan Shapes") comp.layer(rl).remove();
@@ -562,11 +778,11 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         var fpsScale = timing.scale;
         $.writeln("[Tokgan] data fps=" + data.fps + " comp fps=" + comp.frameRate + " scale=" + fpsScale);
 
-        STEP = "build-groups";
         var shapes = data.shapes;
         for (var s = 0; s < shapes.length; s++) {{
             var sd = shapes[s];
-            STEP = "group " + (s + 1) + "/" + shapes.length + " (" + sd.name + ")";
+            STEP = tokganStep(prog, "group " + (s + 1) + "/" + shapes.length + " (" + sd.name + ", " +
+                                    sd.times.length + " keys)");
 
             var grp = root.addProperty("ADBE Vector Group");
             grp.name = sd.name;
@@ -606,18 +822,11 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             // Transform, NOT layer.transform (which would affect everything).
             if (sd.opacity.length > 0) {{
                 var op = grp.property("ADBE Vector Transform Group").property("ADBE Vector Group Opacity");
-                for (var j = 0; j < sd.opacity.length; j++) {{
-                    op.setValueAtTime(sd.opacity[j][0] * fpsScale, sd.opacity[j][1]);
-                    op.setInterpolationTypeAtKey(
-                        op.numKeys,
-                        KeyframeInterpolationType.HOLD,
-                        KeyframeInterpolationType.HOLD
-                    );
-                }}
+                tokganHeldKeys(op, sd.opacity, fpsScale);
             }}
         }}
 
-        STEP = "layer-transform-and-motion-blur";
+        STEP = tokganStep(prog, "layer-transform-and-motion-blur");
         // Layer origin at comp (0.5, 0.5): the JSON's pixel coordinates name pixel CENTRES (as Silhouette,
         // Nuke and the Kthanid matte read them), while AE's comp space puts (0, 0) at the top-left
         // CORNER of the first pixel. At (0, 0) every shape rendered half a pixel up and left -- measured
@@ -626,20 +835,16 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         layer.transform.position.setValue([0.5, 0.5]);
         layer.motionBlur = true;
 
+        tokganCommentNote(comp, timing.note);
         var tDone = ((new Date()).getTime() - tBuild) / 1000;
         app.endUndoGroup();
 
-        $.writeln(
-            "[Tokgan import] " + shapes.length + " layers; " +
-            "JSON parse " + tParse.toFixed(2) + "s; " +
-            "AE build " + tDone.toFixed(2) + "s"
-        );
-        if (timing.note) {{
-            $.writeln("[Tokgan] " + timing.note);
-            alert("Tokgan import: " + timing.note);
-        }}
+        tokganDone(prog, "Imported " + shapes.length + " shape groups (JSON parse " + tParse.toFixed(1) +
+                         " s, AE build " + tDone.toFixed(1) + " s)", timing.note);
     }} catch (err) {{
         try {{ app.endUndoGroup(); }} catch (e2) {{}}
+        tokganFailed(prog, STEP, err);
+        // The one modal dialog: a failure, after the undo group is closed.
         alert(
             "Tokgan import failed.\n" +
             "Step: " + STEP + "\n" +
@@ -665,32 +870,25 @@ LOADER_HIER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (ca
 (function() {
 __COMMON__
     var STEP = "init";
+    var prog = tokganProgressOpen("Tokgan import (hierarchy)");
     try {
-        STEP = "find-sidecar";
         var expectedName = "__DATA_BASENAME__";
-        var siblings = (new File($.fileName)).parent.getFiles();
-        var dataFile = null;
-        for (var fi = 0; fi < siblings.length; fi++) {
-            if (siblings[fi] instanceof File && siblings[fi].displayName === expectedName) {
-                dataFile = siblings[fi];
-                break;
-            }
-        }
+        STEP = tokganStep(prog, "find-sidecar (" + expectedName + ")");
+        var dataFile = tokganFindSidecar(expectedName);
         if (!dataFile) {
-            dataFile = File.openDialog(
-                "Locate sidecar: " + expectedName +
-                " (generated by tokgan_json_to_ae.py, NOT the raw Tokgan JSON)");
-            if (!dataFile) return;
+            tokganStep(prog, "cancelled: no sidecar");
+            return;
         }
 
-        STEP = "read-sidecar (" + dataFile.fsName + ")";
+        STEP = tokganStep(prog, "read-sidecar (" + dataFile.fsName + ", " + dataFile.length + " bytes)");
         dataFile.encoding = "UTF-8";
         if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
         var raw = dataFile.read();
         dataFile.close();
 
-        STEP = "json-parse (" + raw.length + " chars)";
-        var data = (typeof JSON !== "undefined" && JSON.parse) ? JSON.parse(raw) : eval("(" + raw + ")");
+        STEP = tokganStep(prog, "json-parse (" + raw.length + " chars)");
+        var data = tokganParse(raw);
+        raw = null;
         if (data.mode !== "hierarchy" || !data.camera || !data.precomp) {
             throw new Error(dataFile.displayName + " is not a Tokgan hierarchy sidecar; " +
                             "re-run tokgan_json_to_ae.py on the raw JSON.");
@@ -698,7 +896,7 @@ __COMMON__
 
         app.beginUndoGroup("Import Tokgan Hierarchy");
 
-        STEP = "init-comp";
+        STEP = tokganStep(prog, "init-comp");
         var comp = app.project.activeItem;
         if (!(comp instanceof CompItem)) {
             comp = app.project.items.addComp("TokganShapes", data.width, data.height, 1,
@@ -747,17 +945,18 @@ __COMMON__
             return s;
         }
 
-        STEP = "precomp";
+        STEP = tokganStep(prog, "precomp");
         var pre = app.project.items.addComp("Tokgan Stabilised", data.precomp.width,
                                             data.precomp.height, 1, comp.duration, comp.frameRate);
         pre.motionBlur = true;
         // Same numbering inside, so a frame number reads the same in both.
         tokganDisplayStart(pre, data);
 
-        STEP = "persons";
         var nulls = {};
         for (var pi = 0; pi < data.persons.length; pi++) {
             var pd = data.persons[pi];
+            STEP = tokganStep(prog, "person " + (pi + 1) + "/" + data.persons.length + " (" + pd.name + ", " +
+                                    pd.times.length + " keys)");
             var nl = pre.layers.addNull(pre.duration);
             nl.name = pd.name;
             // Anchor at the Null's own origin, so a child's position is its
@@ -767,10 +966,10 @@ __COMMON__
             nulls[pd.pid] = nl;
         }
 
-        STEP = "shapes";
         for (var s = data.shapes.length - 1; s >= 0; s--) {
             var sd = data.shapes[s];
-            STEP = "shape " + (s + 1) + "/" + data.shapes.length + " (" + sd.name + ")";
+            STEP = tokganStep(prog, "shape " + (data.shapes.length - s) + "/" + data.shapes.length + " (" +
+                                    sd.name + ", " + sd.times.length + " keys)");
             var sl = pre.layers.addShape();
             sl.name = sd.name;
             sl.transform.anchorPoint.setValue([0, 0]);
@@ -806,15 +1005,11 @@ __COMMON__
 
             if (sd.opacity.length > 0) {
                 var op = grp.property("ADBE Vector Transform Group").property("ADBE Vector Group Opacity");
-                for (var q = 0; q < sd.opacity.length; q++) {
-                    op.setValueAtTime(sd.opacity[q][0] * fpsScale, sd.opacity[q][1]);
-                    op.setInterpolationTypeAtKey(op.numKeys, KeyframeInterpolationType.HOLD,
-                                                 KeyframeInterpolationType.HOLD);
-                }
+                tokganHeldKeys(op, sd.opacity, fpsScale);
             }
         }
 
-        STEP = "camera";
+        STEP = tokganStep(prog, "camera (" + data.camera.times.length + " keys)");
         var lay = comp.layers.add(pre);
         lay.name = "Tokgan Shapes";
         // Layer space == comp space, so the Corner Pin points are plate pixels -- placed at (0.5, 0.5)
@@ -834,15 +1029,14 @@ __COMMON__
             keyLinear(pin.property(names[c]), ct, vals);
         }
 
+        tokganCommentNote(comp, timing.note);
         app.endUndoGroup();
-        $.writeln("[Tokgan hierarchy] " + data.persons.length + " persons, " +
-                  data.shapes.length + " parts, " + data.camera.times.length + " camera keys");
-        if (timing.note) {
-            $.writeln("[Tokgan] " + timing.note);
-            alert("Tokgan import: " + timing.note);
-        }
+        tokganDone(prog, "Imported " + data.persons.length + " person(s), " + data.shapes.length +
+                         " part layers, " + data.camera.times.length + " camera keys", timing.note);
     } catch (err) {
         try { app.endUndoGroup(); } catch (e2) {}
+        tokganFailed(prog, STEP, err);
+        // The one modal dialog: a failure, after the undo group is closed.
         alert("Tokgan import failed.\nStep: " + STEP + "\nError: " + err.toString() +
               "\nLine:  " + (err.line || "?"));
     }
@@ -864,33 +1058,26 @@ LOADER_MASKS_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data (S
 (function() {
 __COMMON__
     var STEP = "init";
+    var prog = tokganProgressOpen("Tokgan import (Solid + masks)");
     try {
-        STEP = "find-sidecar";
         var expectedName = "__DATA_BASENAME__";
-        var siblings = (new File($.fileName)).parent.getFiles();
-        var dataFile = null;
-        for (var fi = 0; fi < siblings.length; fi++) {
-            if (siblings[fi] instanceof File && siblings[fi].displayName === expectedName) {
-                dataFile = siblings[fi];
-                break;
-            }
-        }
+        STEP = tokganStep(prog, "find-sidecar (" + expectedName + ")");
+        var dataFile = tokganFindSidecar(expectedName);
         if (!dataFile) {
-            dataFile = File.openDialog(
-                "Locate sidecar: " + expectedName +
-                " (generated by tokgan_json_to_ae.py, NOT the raw Tokgan JSON)");
-            if (!dataFile) return;
+            tokganStep(prog, "cancelled: no sidecar");
+            return;
         }
 
-        STEP = "read-sidecar (" + dataFile.fsName + ")";
+        STEP = tokganStep(prog, "read-sidecar (" + dataFile.fsName + ", " + dataFile.length + " bytes)");
         dataFile.encoding = "UTF-8";
         if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
         var raw = dataFile.read();
         dataFile.close();
 
-        STEP = "json-parse (" + raw.length + " chars)";
+        STEP = tokganStep(prog, "json-parse (" + raw.length + " chars)");
         var t0 = (new Date()).getTime();
-        var data = (typeof JSON !== "undefined" && JSON.parse) ? JSON.parse(raw) : eval("(" + raw + ")");
+        var data = tokganParse(raw);
+        raw = null;
         var tParse = ((new Date()).getTime() - t0) / 1000;
         if (data.mode !== "masks" || !data.solids) {
             throw new Error(dataFile.displayName + " is not a Tokgan Solid + masks sidecar; " +
@@ -899,7 +1086,7 @@ __COMMON__
 
         app.beginUndoGroup("Import Tokgan Masks");
 
-        STEP = "init-comp";
+        STEP = tokganStep(prog, "init-comp (parsed in " + tParse.toFixed(1) + " s)");
         var comp = app.project.activeItem;
         if (!(comp instanceof CompItem)) {
             comp = app.project.items.addComp("TokganShapes", data.width, data.height, 1,
@@ -933,7 +1120,8 @@ __COMMON__
         // first person ends up as the top layer, as in the other layouts.
         for (var p = data.solids.length - 1; p >= 0; p--) {
             var sd = data.solids[p];
-            STEP = "solid " + sd.name;
+            STEP = tokganStep(prog, "solid " + (data.solids.length - p) + "/" + data.solids.length + " (" +
+                                    sd.name + ", " + sd.masks.length + " masks)");
             // Comp-sized and at the comp's centre (addSolid's default), so
             // layer space == comp space; the half-pixel centre is already in
             // the vertices.
@@ -943,7 +1131,8 @@ __COMMON__
 
             for (var m = 0; m < sd.masks.length; m++) {
                 var md = sd.masks[m];
-                STEP = "mask " + (m + 1) + "/" + sd.masks.length + " (" + md.name + ")";
+                STEP = tokganStep(prog, "mask " + (m + 1) + "/" + sd.masks.length + " (" + md.name + ", " +
+                                        md.times.length + " keys)");
                 // AE 25.6 invalidates earlier property references when the
                 // parent changes, so re-acquire the new mask by index.
                 var parade = layer.property("ADBE Mask Parade");
@@ -978,16 +1167,15 @@ __COMMON__
             }
         }
 
+        tokganCommentNote(comp, timing.note);
         var tDone = ((new Date()).getTime() - tBuild) / 1000;
         app.endUndoGroup();
-        $.writeln("[Tokgan masks] " + data.solids.length + " solids, " + nMasks + " masks; " +
-                  "JSON parse " + tParse.toFixed(2) + "s; AE build " + tDone.toFixed(2) + "s");
-        if (timing.note) {
-            $.writeln("[Tokgan] " + timing.note);
-            alert("Tokgan import: " + timing.note);
-        }
+        tokganDone(prog, "Imported " + data.solids.length + " solid(s), " + nMasks + " masks (JSON parse " +
+                         tParse.toFixed(1) + " s, AE build " + tDone.toFixed(1) + " s)", timing.note);
     } catch (err) {
         try { app.endUndoGroup(); } catch (e2) {}
+        tokganFailed(prog, STEP, err);
+        // The one modal dialog: a failure, after the undo group is closed.
         alert("Tokgan import failed.\nStep: " + STEP + "\nError: " + err.toString() +
               "\nLine:  " + (err.line || "?"));
     }
@@ -1063,12 +1251,14 @@ def _clip_frames(data):
 
 
 def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
-            keep_background=False, fps_override=None, force=False, log=print):
+            keep_background=False, fps_override=None, force=False,
+            max_cp=DEFAULT_MAX_CP, log=print):
     """Write the AE loader (.jsx) and its sidecar for one shape JSON.
 
     `layout="masks"` writes the Solid + masks loader (always flat);
     "shapes" (the default) the shape-layer one, a hierarchy for a v3 JSON
-    unless `flat`.
+    unless `flat`. Path keys over `max_cp` control points are resampled down
+    to it (0 = keep every point).
 
     The command line is a thin wrapper around this; Rotobot Queue calls it
     directly. `log` receives the same progress lines the CLI prints.
@@ -1076,6 +1266,9 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
     if layout not in LAYOUTS:
         raise ValueError("layout must be one of %s, not %r" % (", ".join(LAYOUTS), layout))
     requested = "masks" if layout == "masks" else ("flat" if flat else "auto")
+    max_cp = int(max_cp or 0)
+    if max_cp < 0:
+        raise ValueError("max_cp must be 0 (no cap) or more, not %d" % max_cp)
 
     in_path = in_path_arg
     out_jsx = out_jsx_arg or os.path.splitext(in_path)[0] + ".jsx"
@@ -1094,7 +1287,8 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
             # --flat changes the output for the same input, so a sidecar is
             # only reusable when it was built with the same request.
             sidecar_schema_ok = (_side.get("schema") == PAYLOAD_SCHEMA
-                                 and _side.get("requested") == requested)
+                                 and _side.get("requested") == requested
+                                 and _side.get("max_cp") == max_cp)
             sidecar_mode = _side.get("mode", "flat")
         except (OSError, ValueError):
             sidecar_schema_ok = False
@@ -1120,6 +1314,9 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
     else:
         with open(in_path, encoding="utf-8") as f:
             data = json.load(f)
+        n_capped = cap_control_points(data, max_cp)
+        if n_capped:
+            log(f"  Control points: {n_capped} path key(s) resampled to {max_cp}")
 
         res = data.get("resolution", [data.get("width", 2160), data.get("height", 4096)])
         width, height = int(res[0]), int(res[1])
@@ -1169,8 +1366,9 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
                 f"  Solid + masks: {len(payload['solids'])} solid(s), "
                 f"{len(shapes)} masks\n")
         elif mode == "hierarchy":
+            # The hierarchy reads the JSON itself; hand it the capped one.
             payload = build_hierarchy_payload(
-                in_path, data, set(keep_names), person_color,
+                io.StringIO(json.dumps(data)) if n_capped else in_path, data, set(keep_names), person_color,
                 width, height, fps, start_frame, end_frame)
             shapes = payload["shapes"]
             pre = payload["precomp"]
@@ -1201,6 +1399,7 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
                 "shapes": shapes,
             }
         payload["requested"] = requested
+        payload["max_cp"] = max_cp
         payload["retime"] = retime
         if frame_start is not None:
             payload["frame_start"] = frame_start
@@ -1324,11 +1523,25 @@ def main():
             "dense clips. Always flat (no camera / person hierarchy)."
         ),
     )
+    p.add_argument(
+        "--max-cp",
+        type=int,
+        default=DEFAULT_MAX_CP,
+        metavar="N",
+        help=(
+            "Resample any path key with more than N control points to N, "
+            "spaced evenly along the curve (default %d; 0 keeps every "
+            "point). Every point is keyed on every frame, so dense shapes "
+            "make long shots slow to import." % DEFAULT_MAX_CP
+        ),
+    )
     args = p.parse_args()
+    if args.max_cp < 0:
+        p.error("--max-cp must be 0 (no cap) or more")
     convert(args.input, args.output, flat=args.flat,
             layout="masks" if args.masks else "shapes",
             keep_background=args.keep_background, fps_override=args.fps,
-            force=args.force)
+            force=args.force, max_cp=args.max_cp)
 
 
 if __name__ == "__main__":

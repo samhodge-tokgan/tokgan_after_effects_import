@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -135,6 +136,58 @@ class TestLoaderUnderMockAE:
         assert res["shape_layers"] == 2 and res["parented"] == 2 and res["nulls"] == 1
         assert res["vertices_checked"] > 0
         assert res["worst_px"] < 0.05, res
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+class TestNoModalOnSuccess:
+    """A success-path alert can open behind the host window on Windows, and
+    the host then looks frozen. With the operator's own comp active at
+    another rate, the fps note goes to the comp comment and the palette."""
+
+    def _run(self, tmp_path, *args):
+        src = tmp_path / "clip.json"
+        doc = json.loads((FIXTURES / "v3_real_cut.json").read_text())
+        doc["fps"], doc["frame_start"] = 30, 1001
+        src.write_text(json.dumps(doc))
+        r = subprocess.run([sys.executable, str(SCRIPT), str(src), *args],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        out = subprocess.run(["node", str(HERE / "ae_mock.js"), str(tmp_path / "clip.jsx"), str(src)],
+                             capture_output=True, text=True,
+                             env={**os.environ, "AE_MOCK_ACTIVE_FPS": "24"})
+        assert out.returncode == 0, out.stderr      # alert() throws in the mock
+        return json.loads(out.stdout)
+
+    @pytest.mark.parametrize("args", [(), ("--flat",)])
+    def test_fps_note_without_a_dialog(self, tmp_path, args):
+        res = self._run(tmp_path, *args)
+        assert res["comment"].startswith("artist notes\nTokgan import: This clip runs at 30 fps")
+        (pal,) = res["palette"]
+        assert pal["type"] == "palette" and pal["shown"]
+        assert pal["text"][-1].startswith("Imported ") and "runs at 30 fps" in pal["text"][-1]
+        assert "find-sidecar" in res["log"] and "] done: Imported " in res["log"]
+        assert "note: This clip runs at 30 fps" in res["log"]
+
+    def test_a_rerun_replaces_the_note(self, tmp_path):
+        res = self._run(tmp_path, "--flat")
+        assert res["comment"].count("Tokgan import:") == 1
+
+
+class TestControlPointCap:
+    def test_dense_keys_are_resampled_to_the_cap(self):
+        import math
+        pts = []
+        for i in range(200):
+            a = 2 * math.pi * i / 200
+            x, y, tx, ty, h = 500 * math.cos(a), 500 * math.sin(a), -math.sin(a), math.cos(a), 5.236
+            pts.append(dict(x=x, y=y, left_x=x - tx * h, left_y=y - ty * h,
+                            right_x=x + tx * h, right_y=y + ty * h))
+        out = conv.resample_points(pts, True, conv.DEFAULT_MAX_CP)
+        assert conv.DEFAULT_MAX_CP == 96 and len(out) == 96
+        assert all(abs(math.hypot(p["x"], p["y"]) - 500) < 1e-3 for p in out)
+        assert conv.resample_points(pts, True, 0) is pts
+        few = pts[:50]
+        assert conv.resample_points(few, True, 96) is few
 
 
 class TestConvertAPI:

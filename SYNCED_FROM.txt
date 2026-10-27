@@ -2,4 +2,4 @@
 # Change them there, then re-sync (packaging/ci/sync-downstream-dcc.sh); Rotobot-Next CI fails if they
 # are edited here (packaging/ci/check-downstream-dcc-sync.sh).
 repo    https://github.com/samhodge-tokgan/Rotobot-Next
-commit  fb5d75fee33bffe5adfa27a028f992beedf1c653  (chore(integrations): keep private issue numbers and host names out of the public DCC copies (#413))
+commit  a47535c96001cdee65e6b9ecb12c10f359449cf4  (fix(after-effects): the progress palette must not keep the parsed sidecar alive)
