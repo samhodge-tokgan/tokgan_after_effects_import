@@ -138,13 +138,15 @@ new one.
 ```
 $ python3 tokgan_json_to_ae.py --help
 usage: tokgan_json_to_ae [-h] [-f] [--keep-background] [--fps FPS] [--flat]
+                         [--masks] [--max-cp N]
                          input [output]
 
 Convert a Tokgan JSON shape file into an After Effects loader (.jsx) plus a
 compact sidecar data JSON. Run the resulting .jsx in AE via File > Scripts >
 Run Script File... A v2 JSON builds one shape layer holding an animated Bezier
 path per object; a v3 JSON (camera + person data) builds a camera Corner Pin,
-a Null per person and a shape layer per body part.
+a Null per person and a shape layer per body part. --masks builds one solid
+per person with a mask per body part instead.
 
 positional arguments:
   input              Path to input Tokgan JSON file
@@ -168,32 +170,61 @@ options:
   --flat             Always build the single 'Tokgan Shapes' layer, even for a
                      v3 JSON with camera/person data (which otherwise builds
                      the camera / person / body-part hierarchy).
+  --masks            Solid + masks: one solid per person and one Add mask per
+                     body part, its Mask Path keyed per frame and its Mask
+                     Opacity held 0/100 for visibility. Faster to import than
+                     shape layers on dense clips. Always flat (no camera /
+                     person hierarchy).
+  --max-cp N         Resample any path key with more than N control points to
+                     N, spaced evenly along the curve (default 96; 0 keeps
+                     every point). Every point is keyed on every frame, so
+                     dense shapes make long shots slow to import.
 
-Notes: each source frame lands on one comp frame regardless of the JSON's
-declared fps. Enable 'Allow Scripts to Write Files and Access Network' in AE's
-preferences (Scripting & Expressions) before running the loader.
+Notes: comp time 0 is the clip's first frame. A comp the loader creates runs
+at the JSON's fps; when the JSON has frame_start, the comp's timeline is
+numbered from it. A JSON without frame_start that says 24 fps (every file
+before v0.20) is retimed to one source frame per comp frame. Enable 'Allow
+Scripts to Write Files and Access Network' in AE's preferences (Scripting &
+Expressions) before running the loader.
 ```
 
 ## What the loader does, in order
 
-1. Locates its sidecar `_data.json` next to itself via `parent.getFiles()`
-   (avoids the ExtendScript File-constructor quirks with `:` and spaces in
-   filenames).
-2. Reads + parses the sidecar (`JSON.parse`, with `eval("("+raw+")")`
+1. Opens a small non-modal progress palette and starts
+   `<stem>_import.log` next to the `.jsx`: one timestamped line per step,
+   with counts, and the total time at the end. If an import ever seems stuck,
+   the last line of the log says where. Neither the palette nor the log can
+   stop an import; if one can't be made it is skipped.
+2. Locates its sidecar `_data.json` next to itself: by path first, then by
+   listing the folder with `parent.getFiles()` (robust to the ExtendScript
+   File-constructor quirks with `:` and spaces in filenames), and only then
+   asks with a file dialog.
+3. Reads + parses the sidecar (`JSON.parse`, with `eval("("+raw+")")`
    fallback for ExtendScript builds that lack `JSON`).
-3. Uses the active comp, or creates one with the JSON's resolution / fps /
+4. Uses the active comp, or creates one with the JSON's resolution / fps /
    duration if none is active.
-4. Removes any pre-existing *Tokgan Shapes* layer for clean re-runs.
-5. For each source object, adds a Vector Group whose Contents holds a Path
+5. Removes any pre-existing *Tokgan Shapes* layer for clean re-runs.
+6. For each source object, adds a Vector Group whose Contents holds a Path
    and a Fill. The path bezier is written in one batched
    `setValuesAtTimes(...)` call, with a per-frame fallback. The group's
-   `Transform > Opacity` gets hold-stepped 0/100 keys around every visible
-   segment.
-6. Resets the layer's anchor and position to `(0,0)` so JSON pixel coords
-   land at comp pixel coords with no half-resolution offset.
-7. Scales every keyframe time by `data.fps / comp.frameRate` so each source
-   frame lands on one comp frame regardless of declared fps.
-8. Enables `layer.motionBlur` and `comp.motionBlur`.
+   `Transform > Opacity` gets hold-stepped 0/100 keys: one at the clip's
+   start and one wherever visibility changes.
+7. Places the layer at `(0.5, 0.5)`: JSON coordinates name pixel centres,
+   AE's `(0, 0)` is the first pixel's top-left corner.
+8. Keys at the clip's own times when the JSON declares its real fps, or
+   scales every key time by `data.fps / comp.frameRate` for older JSONs, so
+   each source frame lands on one comp frame.
+9. Enables `layer.motionBlur` and `comp.motionBlur`.
+10. Finishes **without a dialog**: the palette stays open with the summary.
+    When the active comp runs at another rate than the clip, that note goes
+    in the palette, the comp's comment and the ExtendScript console. Only a
+    failure opens an alert (a modal on success can open behind the AE window
+    on Windows, which makes AE look frozen).
+
+The converter caps each path key at `--max-cp` control points (default 96;
+`0` keeps them all), resampling denser shapes evenly along the curve. Every
+point is keyed on every frame, so dense shapes otherwise make long shots slow
+to parse and key in AE.
 
 ## Example
 
