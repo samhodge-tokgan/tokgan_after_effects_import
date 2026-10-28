@@ -125,8 +125,94 @@ class TestHierarchyPayload:
         assert "--flat" in str(e.value)
 
 
+def drifting_camera(tmp_path, persp=0.0004):
+    """v3_real_cut.json with a camera that runs away in perspective (as a tracker
+    that has lost the plate does): frame k gets a horizontal projective term
+    growing as persp * k, tagged as a good solve."""
+    data = json.loads((FIXTURES / "v3_real_cut.json").read_text())
+    for k, f in enumerate(sorted(data["camera"], key=int)):
+        cam = data["camera"][f]
+        cam["H2d"] = [1, 0, 0, 0, 1, 0, persp * k, 0, 1]
+        cam["source"] = "ecc"
+    src = tmp_path / "clip.json"
+    src.write_text(json.dumps(data))
+    return src
+
+
+def run_src(src, *args):
+    out = subprocess.run([sys.executable, str(SCRIPT), str(src), *args],
+                         capture_output=True, text=True, cwd=src.parent)
+    assert out.returncode == 0, out.stderr
+    return src.with_suffix(".jsx"), json.loads((src.parent / "clip_data.json").read_text()), out.stdout
+
+
+class TestCornerPinGuard:
+    W, H = 3840, 2160
+    PLATE = [[0, 0], [3840, 0], [0, 2160], [3840, 2160]]  # UL, UR, LL, LR
+
+    def test_a_plain_plate_passes(self):
+        assert conv.corner_pin_problem([self.PLATE] * 3, self.W, self.H) is None
+
+    def test_a_folded_quad_is_caught(self):
+        ul, ur, ll, lr = self.PLATE
+        first, count, why = conv.corner_pin_problem([self.PLATE, [ul, ur, lr, ll]], self.W, self.H)
+        assert (first, count) == (1, 1) and "folds" in why
+
+    def test_an_oversized_quad_is_caught(self):
+        wide = [[0, 0], [40000, 0], [0, 2160], [40000, 2160]]
+        first, count, why = conv.corner_pin_problem([self.PLATE, wide, wide], self.W, self.H)
+        assert (first, count) == (1, 2) and "across" in why
+
+    def test_a_long_pan_keeps_its_camera(self):
+        # A pan carries a wide precomp across the plate without enlarging it.
+        pw, ph = 12000, 2160
+        quads = [[[-x, 0], [pw - x, 0], [-x, ph], [pw - x, ph]] for x in range(0, 8000, 400)]
+        assert conv.corner_pin_problem(quads, pw, ph) is None
+
+    def test_magnifying_the_precomp_is_caught(self):
+        big = [[0, 0], [3840 * 2.5, 0], [0, 2160], [3840, 2160]]
+        assert conv.corner_pin_problem([self.PLATE, big], self.W, self.H) is not None
+
+    def test_a_pin_that_explodes_later_is_caught_from_that_frame(self):
+        # The shape seen on a lost track: a sane quad, then one that keeps widening.
+        quads = [self.PLATE] * 5 + [[[0, 0], [3840 * k, 0], [0, 2160], [3840, 2160]] for k in (2, 6, 9)]
+        first, count, why = conv.corner_pin_problem(quads, self.W, self.H)
+        assert (first, count) == (6, 2) and "across" in why
+
+    def test_a_real_camera_is_kept(self, tmp_path):
+        _, _, data, stdout = run(tmp_path, "v3_real_cut.json")
+        assert data["camera_dropped"] is None
+        assert "NOTE: camera not usable" not in stdout
+
+    def test_a_drifting_camera_is_dropped(self, tmp_path):
+        _, data, stdout = run_src(drifting_camera(tmp_path))
+        assert data["mode"] == "hierarchy"
+        assert data["camera_dropped"].startswith("camera not usable in After Effects")
+        assert data["held"][0] == data["camera_dropped"]
+        assert "NOTE: camera not usable" in stdout
+        # Without the camera the precomp is the plate plus its margins, and the
+        # pin is the same plate-sized quad on every frame.
+        pre = data["precomp"]
+        assert pre["width"] <= 3840 + 4 * conv.PRECOMP_MARGIN
+        assert pre["height"] <= 2160 + 4 * conv.PRECOMP_MARGIN
+        assert conv.corner_pin_problem(data["camera"]["corners"], pre["width"], pre["height"]) is None
+        assert all(c == data["camera"]["corners"][0] for c in data["camera"]["corners"])
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 class TestLoaderUnderMockAE:
+    def test_loader_recomposes_every_vertex_without_the_camera(self, tmp_path):
+        src = drifting_camera(tmp_path)
+        jsx, data, _ = run_src(src)
+        assert data["camera_dropped"]
+        out = subprocess.run(["node", str(HERE / "ae_mock.js"), str(jsx), str(src)],
+                             capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        res = json.loads(out.stdout)
+        assert res["shape_layers"] == 2 and res["parented"] == 2 and res["nulls"] == 1
+        assert res["vertices_checked"] > 0
+        assert res["worst_px"] < 0.05, res
+
     def test_loader_recomposes_every_vertex(self, tmp_path):
         src, jsx, _, _ = run(tmp_path, "v3_real_cut.json")
         out = subprocess.run(["node", str(HERE / "ae_mock.js"), str(jsx), str(src)],
