@@ -429,6 +429,15 @@ def corner_pin_problem(corners, precomp_w, precomp_h):
     return None if first is None else (first, count, reason)
 
 
+#: Camera ``source`` the engine writes on every frame of a shot whose background
+#: moves by itself (water, foliage): no camera move was tracked, and each frame
+#: holds the identity.
+NONRIGID = "ecc-nonrigid"
+NONRIGID_NOTE = ("camera not usable (the background moves by itself, e.g. water; "
+                 "no camera move to track): built without the camera layer, "
+                 "persons and parts unchanged")
+
+
 def build_hierarchy_payload(in_path, data, keep_names, person_color,
                             width, height, fps, start_frame, end_frame):
     """Payload for the hierarchy loader: camera corner pin, person Nulls and
@@ -436,7 +445,8 @@ def build_hierarchy_payload(in_path, data, keep_names, person_color,
     code is missing or the decomposition does not reproduce the source. A
     camera that would make an unusable Corner Pin (corner_pin_problem) is
     dropped: the hierarchy is rebuilt with an identity camera, which keeps the
-    person and part layers exact, and the reason is reported."""
+    person and part layers exact, and the reason is reported. So is a camera
+    the engine tagged ecc-nonrigid."""
     load_json, hier_api = _hierarchy_api()
     ROUND_TRIP_TOLERANCE_PX = hier_api.ROUND_TRIP_TOLERANCE_PX
     apply_h, decompose, round_trip_error = hier_api.apply_h, hier_api.decompose, hier_api.round_trip_error
@@ -478,8 +488,13 @@ def build_hierarchy_payload(in_path, data, keep_names, person_color,
         ]
         return hier, ox, oy, pw, ph, corners
 
-    hier, ox, oy, pw, ph, cam_corners = layout()
     camera_dropped = None
+    if doc.camera and any((c.source or "") == NONRIGID for c in doc.camera.values()):
+        # No camera move was tracked (the background moves by itself): no
+        # camera layer at all, rather than one that never moves.
+        camera_dropped = NONRIGID_NOTE
+        doc.camera = None
+    hier, ox, oy, pw, ph, cam_corners = layout()
     if doc.camera:
         if max(pw, ph) > AE_MAX_COMP_SIZE:
             bad = (0, len(cam_corners), "the stabilised precomp would be %dx%d" % (pw, ph))
