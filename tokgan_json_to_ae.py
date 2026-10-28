@@ -107,6 +107,18 @@ PIXEL_CENTRE = 0.5
 PRECOMP_MARGIN = 64
 AE_MAX_COMP_SIZE = 30000
 
+# The camera Corner Pin must stay a real quad of a sane size on every frame.
+# A camera track that has lost the plate (water, a long pan) can stay inside
+# the tracker's own horizon test and still pin the stabilised precomp tens of
+# thousands of pixels wide: AE then stops with "Corner Pin cannot allocate a
+# buffer larger than 30000 pixels", or crawls rendering buffers that size. A
+# camera move, however long, carries the precomp about without enlarging it;
+# lost perspective magnifies it. So a quad wider than this many times the
+# precomp (or than AE's buffer), or folded, makes the converter build the
+# hierarchy without the camera instead.
+CORNER_PIN_MAX_MAGNIFICATION = 2.0
+AE_MAX_BUFFER = 30000
+
 BACKGROUND_GREY = [0.5, 0.5, 0.5]
 
 # At most this many control points per path key (--max-cp; 0 = no cap). Every
@@ -389,57 +401,103 @@ def _hierarchy_api():
             "--flat for the single-layer import.")
 
 
+def corner_pin_problem(corners, precomp_w, precomp_h):
+    """Why a camera Corner Pin is unusable in AE, or None. ``corners`` holds one
+    quad per frame in AE's order (upper-left, upper-right, lower-left,
+    lower-right) for a precomp of precomp_w x precomp_h. Returns
+    (first bad index, bad count, reason)."""
+    limit = min(AE_MAX_BUFFER, CORNER_PIN_MAX_MAGNIFICATION * max(precomp_w, precomp_h))
+    first, count, reason = None, 0, None
+    for i, (ul, ur, ll, lr) in enumerate(corners):
+        ring = (ul, ur, lr, ll)  # walk the quad's boundary
+        cross = []
+        for k in range(4):
+            (x0, y0), (x1, y1), (x2, y2) = ring[k], ring[(k + 1) % 4], ring[(k + 2) % 4]
+            cross.append((x1 - x0) * (y2 - y1) - (y1 - y0) * (x2 - x1))
+        xs = [p[0] for p in ring]
+        ys = [p[1] for p in ring]
+        extent = max(max(xs) - min(xs), max(ys) - min(ys))
+        why = None
+        if not (all(c > 0 for c in cross) or all(c < 0 for c in cross)):
+            why = "the pinned quad folds over"
+        elif not extent <= limit:  # also catches NaN
+            why = "the pinned quad is %.0f px across (limit %.0f)" % (extent, limit)
+        if why:
+            count += 1
+            if first is None:
+                first, reason = i, why
+    return None if first is None else (first, count, reason)
+
+
 def build_hierarchy_payload(in_path, data, keep_names, person_color,
                             width, height, fps, start_frame, end_frame):
     """Payload for the hierarchy loader: camera corner pin, person Nulls and
     bone-local shape layers. Raises SystemExit with a fix when the hierarchy
-    code is missing or the decomposition does not reproduce the source."""
-    load_json, hier = _hierarchy_api()
-    ROUND_TRIP_TOLERANCE_PX = hier.ROUND_TRIP_TOLERANCE_PX
-    apply_h, decompose, round_trip_error = hier.apply_h, hier.decompose, hier.round_trip_error
+    code is missing or the decomposition does not reproduce the source. A
+    camera that would make an unusable Corner Pin (corner_pin_problem) is
+    dropped: the hierarchy is rebuilt with an identity camera, which keeps the
+    person and part layers exact, and the reason is reported."""
+    load_json, hier_api = _hierarchy_api()
+    ROUND_TRIP_TOLERANCE_PX = hier_api.ROUND_TRIP_TOLERANCE_PX
+    apply_h, decompose, round_trip_error = hier_api.apply_h, hier_api.decompose, hier_api.round_trip_error
 
     # `in_path` is a path, or a text stream of the (control-point capped) JSON.
     doc = load_json(in_path)
     doc.objects = {k: o for k, o in doc.objects.items() if k in keep_names}
-    hier = decompose(doc)
-    err = round_trip_error(doc, hier)
-    if err > ROUND_TRIP_TOLERANCE_PX:
-        raise SystemExit(
-            "hierarchy does not reproduce the source vertices (worst error "
-            "%.3f px > %.2f px); use --flat for this file" % (err, ROUND_TRIP_TOLERANCE_PX))
-
-    # Stabilised extent of everything the precomp has to hold: every vertex
-    # and handle, plus the seed plate itself.
-    xs, ys = [0.0, float(width)], [0.0, float(height)]
-    for key, obj in doc.objects.items():
-        for f, fr in obj.frames.items():
-            inv = hier.camera_inv[f]
-            for p in fr.points:
-                for x, y in ((p.x, p.y), (p.left_x, p.left_y), (p.right_x, p.right_y)):
-                    sx, sy = apply_h(inv, x, y)
-                    xs.append(sx); ys.append(sy)
-    ox = PRECOMP_MARGIN - int(min(xs) // 1)
-    oy = PRECOMP_MARGIN - int(min(ys) // 1)
-    pw = int(max(xs) // 1) + 1 + ox + PRECOMP_MARGIN
-    ph = int(max(ys) // 1) + 1 + oy + PRECOMP_MARGIN
-    if max(pw, ph) > AE_MAX_COMP_SIZE:
-        raise SystemExit(
-            "the stabilised precomp would be %dx%d, beyond After Effects' "
-            "%d px limit (a very long camera move); use --flat" % (pw, ph, AE_MAX_COMP_SIZE))
 
     def t_of(f):
         return round((f - start_frame) / fps, 6)
 
-    # Corner Pin, AE's order: upper-left, upper-right, lower-left, lower-right
-    # of the precomp layer, each mapped through the frame's homography.
-    cam_times, cam_corners = [], []
-    for f in hier.frames:
-        h = hier.camera[f]
-        cam_times.append(t_of(f))
-        cam_corners.append([
-            [_r(c) for c in apply_h(h, cx - ox, cy - oy)]
-            for cx, cy in ((0, 0), (pw, 0), (0, ph), (pw, ph))
-        ])
+    def layout():
+        hier = decompose(doc)
+        err = round_trip_error(doc, hier)
+        if err > ROUND_TRIP_TOLERANCE_PX:
+            raise SystemExit(
+                "hierarchy does not reproduce the source vertices (worst error "
+                "%.3f px > %.2f px); use --flat for this file" % (err, ROUND_TRIP_TOLERANCE_PX))
+        # Stabilised extent of everything the precomp has to hold: every vertex
+        # and handle, plus the seed plate itself.
+        xs, ys = [0.0, float(width)], [0.0, float(height)]
+        for key, obj in doc.objects.items():
+            for f, fr in obj.frames.items():
+                inv = hier.camera_inv[f]
+                for p in fr.points:
+                    for x, y in ((p.x, p.y), (p.left_x, p.left_y), (p.right_x, p.right_y)):
+                        sx, sy = apply_h(inv, x, y)
+                        xs.append(sx); ys.append(sy)
+        ox = PRECOMP_MARGIN - int(min(xs) // 1)
+        oy = PRECOMP_MARGIN - int(min(ys) // 1)
+        pw = int(max(xs) // 1) + 1 + ox + PRECOMP_MARGIN
+        ph = int(max(ys) // 1) + 1 + oy + PRECOMP_MARGIN
+        # Corner Pin, AE's order: upper-left, upper-right, lower-left, lower-right
+        # of the precomp layer, each mapped through the frame's homography.
+        corners = [
+            [[_r(c) for c in apply_h(hier.camera[f], cx - ox, cy - oy)]
+             for cx, cy in ((0, 0), (pw, 0), (0, ph), (pw, ph))]
+            for f in hier.frames
+        ]
+        return hier, ox, oy, pw, ph, corners
+
+    hier, ox, oy, pw, ph, cam_corners = layout()
+    camera_dropped = None
+    if doc.camera:
+        if max(pw, ph) > AE_MAX_COMP_SIZE:
+            bad = (0, len(cam_corners), "the stabilised precomp would be %dx%d" % (pw, ph))
+        else:
+            bad = corner_pin_problem(cam_corners, pw, ph)
+        if bad is not None:
+            first, count, reason = bad
+            camera_dropped = (
+                "camera not usable in After Effects (%s, from frame %d; %d of %d frames): "
+                "built without the camera layer, persons and parts unchanged"
+                % (reason, hier.frames[first], count, len(cam_corners)))
+            doc.camera = None
+            hier, ox, oy, pw, ph, cam_corners = layout()
+    if max(pw, ph) > AE_MAX_COMP_SIZE:
+        raise SystemExit(
+            "the stabilised precomp would be %dx%d, beyond After Effects' "
+            "%d px limit; use --flat" % (pw, ph, AE_MAX_COMP_SIZE))
+    cam_times = [t_of(f) for f in hier.frames]
 
     persons = []
     for pid in sorted({hier.person_of[k] for k in doc.objects}):
@@ -493,7 +551,8 @@ def build_hierarchy_payload(in_path, data, keep_names, person_color,
         "camera": {"times": cam_times, "corners": cam_corners},
         "persons": persons,
         "shapes": shapes,
-        "held": hier.held,
+        "held": ([camera_dropped] if camera_dropped else []) + hier.held,
+        "camera_dropped": camera_dropped,
     }
 
 
@@ -908,6 +967,7 @@ __COMMON__
             throw new Error(dataFile.displayName + " is not a Tokgan hierarchy sidecar; " +
                             "re-run tokgan_json_to_ae.py on the raw JSON.");
         }
+        if (data.camera_dropped) tokganLog(prog, "note: " + data.camera_dropped);
 
         app.beginUndoGroup("Import Tokgan Hierarchy");
 
@@ -1410,6 +1470,8 @@ def convert(in_path_arg, out_jsx_arg=None, *, flat=False, layout="shapes",
                 f"{len(payload['camera']['times'])} frames; stabilised "
                 f"precomp {pre['width']}x{pre['height']}\n"
             )
+            if payload.get("camera_dropped"):
+                summary_extra += f"  NOTE: {payload['camera_dropped']}\n"
             if payload["held"]:
                 summary_extra += f"  Held (missing/failed data): {len(payload['held'])} frame(s)\n"
         else:
