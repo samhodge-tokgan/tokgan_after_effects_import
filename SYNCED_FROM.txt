@@ -2,4 +2,4 @@
 # Change them there, then re-sync (packaging/ci/sync-downstream-dcc.sh); Rotobot-Next CI fails if they
 # are edited here (packaging/ci/check-downstream-dcc-sync.sh).
 repo    https://github.com/samhodge-tokgan/Rotobot-Next
-commit  3237a55d56530dbf2d8fafc886d367e7dccc5cb9  (AE export: drop a camera whose Corner Pin AE cannot render)
+commit  0f29ca2db707c6c5101891a7da949ecad412733c  (AE export: drop a camera whose Corner Pin AE cannot render (#461))
