@@ -37,6 +37,12 @@ class Prop {
   setValuesAtTimes(ts, vs) { ts.forEach((t, i) => this.setValueAtTime(t, vs[i])); }
   setInterpolationTypeAtKey(k, a, b) { this.interp[k] = [a, b]; }
   setSpatialAutoBezierAtKey() {} setSpatialContinuousAtKey() {} setSpatialTangentsAtKey() {}
+  // AE 2026: setValuesAtTimes leaves keys LINEAR, no spatial auto-Bezier, zero spatial tangents.
+  keyInInterpolationType(k) { return (this.interp[k] || ["LINEAR"])[0]; }
+  keyOutInterpolationType(k) { return (this.interp[k] || [, "LINEAR"])[1]; }
+  keySpatialAutoBezier() { return false; }
+  keyInSpatialTangent() { return this.kind === "spatial2" ? [0, 0] : [0, 0, 0]; }
+  keyOutSpatialTangent() { return this.kind === "spatial2" ? [0, 0] : [0, 0, 0]; }
   valueAt(t) {
     if (!this.keys.length) return this.value;
     const k = this.keys.find(k => Math.abs(k[0] - t) < KEY_EPS);

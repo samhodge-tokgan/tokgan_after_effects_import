@@ -649,7 +649,9 @@ COMMON_JS = r"""
             } catch (eSh) { pr.text = null; }
         }
         function tokganProgressOpen(title) {
-            var pr = { t0: (new Date()).getTime(), title: title, win: null, text: null, log: null };
+            var pr = { t0: (new Date()).getTime(), title: title, win: null, text: null, log: null,
+                       phases: null, phaseOrder: null };
+            try { $.hiresTimer; } catch (eHr) {}
             try {
                 pr.log = new File((new File($.fileName)).fsName.replace(/\.jsx(bin)?$/i, "") + "_import.log");
                 pr.log.encoding = "UTF-8";
@@ -678,16 +680,23 @@ COMMON_JS = r"""
         }
         // Record a STEP (with counts in its text) and return it for STEP.
         function tokganStep(pr, step) {
+            var carry = (pr.carry || 0) + tokganLap();
+            pr.carry = 0;
             var t = tokganElapsed(pr).toFixed(1);
             tokganLog(pr, "[" + tokganStamp() + " +" + t + "s] " + step);
             tokganShow(pr, pr.title + "\n" + step + "\n" + t + " s");
+            tokganPhase(pr, "progress");
+            pr.carry = carry;
             return step;
         }
         // The end of an import: the summary (and any note) stays in the
         // palette until the operator closes it.
         function tokganDone(pr, summary, note) {
+            tokganPhase(pr, "finish");
             var t = tokganElapsed(pr).toFixed(1);
             tokganLog(pr, "[" + tokganStamp() + " +" + t + "s] done: " + summary + " in " + t + " s");
+            var phases = tokganPhaseLine(pr);
+            if (phases) tokganLog(pr, "phases: " + phases);
             if (note) tokganLog(pr, "note: " + note);
             tokganShow(pr, summary + " in " + t + " s" + (note ? "\n\n" + note : ""));
         }
@@ -696,6 +705,32 @@ COMMON_JS = r"""
             tokganLog(pr, "[" + tokganStamp() + " +" + t + "s] FAILED at " + step + ": " + err.toString() +
                           " (line " + (err.line || "?") + ")");
             tokganShow(pr, "Import failed at: " + step + "\n" + err.toString());
+        }
+
+        // Where the time went (#458): tokganPhase(pr, name) charges the time
+        // since the previous call to `name`, and tokganDone writes the totals
+        // as one "phases:" line in the log -- so an import that is slow on a
+        // customer's machine says which part of it was slow. $.hiresTimer
+        // is microseconds since it was last read; a host without it counts 0.
+        // tokganStep's own time (palette and log) is charged to "progress";
+        // the work before it carries over to the next named phase.
+        function tokganLap() {
+            try { return $.hiresTimer; } catch (eHr) { return 0; }
+        }
+        function tokganPhase(pr, name) {
+            var us = tokganLap() + (pr.carry || 0);
+            pr.carry = 0;
+            if (!pr.phases) { pr.phases = {}; pr.phaseOrder = []; }
+            if (pr.phases[name] === undefined) { pr.phases[name] = 0; pr.phaseOrder.push(name); }
+            pr.phases[name] += us;
+        }
+        function tokganPhaseLine(pr) {
+            if (!pr.phases) return "";
+            var out = [];
+            for (var i = 0; i < pr.phaseOrder.length; i++) {
+                out.push(pr.phaseOrder[i] + " " + (pr.phases[pr.phaseOrder[i]] / 1e6).toFixed(1) + " s");
+            }
+            return out.join(", ");
         }
 
         // The timing note goes in the comp's comment (replacing an earlier
@@ -793,6 +828,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         }}
         var raw = dataFile.read();
         dataFile.close();
+        tokganPhase(prog, "read");
         if (!raw || raw.length === 0) {{
             throw new Error("File.read returned empty string");
         }}
@@ -801,6 +837,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         var t0 = (new Date()).getTime();
         var data = tokganParse(raw);
         raw = null;
+        tokganPhase(prog, "parse");
         var tParse = ((new Date()).getTime() - t0) / 1000;
         if (!data.shapes || data.duration === undefined) {{
             throw new Error(
@@ -890,6 +927,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             if (fillItem && sd.color) {{
                 fillItem.property("ADBE Vector Fill Color").setValue(sd.color);
             }}
+            tokganPhase(prog, "layers");
 
             var shapeObjs = new Array(sd.times.length);
             var scaledTimes = new Array(sd.times.length);
@@ -899,6 +937,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             }}
 
             setPathKeys(pathProp, scaledTimes, shapeObjs);
+            tokganPhase(prog, "path keys");
 
             // Per-group opacity for visibility -- lives under the group's
             // Transform, NOT layer.transform (which would affect everything).
@@ -908,6 +947,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
             }}
             // Keyed: release this part's data.
             shapeObjs = null; scaledTimes = null; sd = null; shapes[s] = null;
+            tokganPhase(prog, "visibility keys");
         }}
 
         STEP = tokganStep(prog, "layer-transform-and-motion-blur");
@@ -921,6 +961,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
 
         tokganCommentNote(comp, timing.note);
         var tDone = ((new Date()).getTime() - tBuild) / 1000;
+        tokganPhase(prog, "comp");
         app.endUndoGroup();
 
         var summary = "Imported " + shapes.length + " shape groups (JSON parse " + tParse.toFixed(1) +
@@ -974,10 +1015,12 @@ __COMMON__
         if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
         var raw = dataFile.read();
         dataFile.close();
+        tokganPhase(prog, "read");
 
         STEP = tokganStep(prog, "json-parse (" + raw.length + " chars)");
         var data = tokganParse(raw);
         raw = null;
+        tokganPhase(prog, "parse");
         if (data.mode !== "hierarchy" || !data.camera || !data.precomp) {
             throw new Error(dataFile.displayName + " is not a Tokgan hierarchy sidecar; " +
                             "re-run tokgan_json_to_ae.py on the raw JSON.");
@@ -1013,11 +1056,33 @@ __COMMON__
         }
         // Linear in time, and straight lines in space for position: the
         // undersampler measures error against linear interpolation.
+        //
+        // setValuesAtTimes already makes its keys that way in After Effects
+        // 2025 and 2026 (temporal LINEAR; spatial: no auto-Bezier, zero
+        // tangents). Setting them again one key at a time -- four calls per
+        // position key, one per rotation key -- was 40% of a full-body
+        // import (#458). So look at the first, middle and last key, and only
+        // walk every key when the host made them some other way.
+        function keysLinear(prop, spatial) {
+            var LIN = KeyframeInterpolationType.LINEAR, n = prop.numKeys;
+            var probe = [1, Math.max(1, Math.floor((n + 1) / 2)), n];
+            for (var p = 0; p < probe.length; p++) {
+                var k = probe[p];
+                if (prop.keyInInterpolationType(k) !== LIN || prop.keyOutInterpolationType(k) !== LIN) return false;
+                if (!spatial) continue;
+                if (prop.keySpatialAutoBezier(k)) return false;
+                var a = prop.keyInSpatialTangent(k), b = prop.keyOutSpatialTangent(k);
+                for (var c = 0; c < a.length; c++) if (a[c] !== 0 || b[c] !== 0) return false;
+            }
+            return true;
+        }
         function keyLinear(prop, times, values) {
             try { prop.setValuesAtTimes(times, values); }
             catch (e) { for (var i = 0; i < times.length; i++) prop.setValueAtTime(times[i], values[i]); }
+            if (prop.numKeys === 0) return;
             var spatial = prop.propertyValueType === PropertyValueType.TwoD_SPATIAL ||
                           prop.propertyValueType === PropertyValueType.ThreeD_SPATIAL;
+            if (keysLinear(prop, spatial)) return;
             var zero = prop.propertyValueType === PropertyValueType.ThreeD_SPATIAL ? [0, 0, 0] : [0, 0];
             for (var k = 1; k <= prop.numKeys; k++) {
                 prop.setInterpolationTypeAtKey(k, KeyframeInterpolationType.LINEAR,
@@ -1052,7 +1117,9 @@ __COMMON__
             // Anchor at the Null's own origin, so a child's position is its
             // offset from the pelvis and nothing else.
             nl.transform.anchorPoint.setValue([0, 0]);
+            tokganPhase(prog, "layers");
             keyLinear(nl.transform.position, scaled(pd.times), pd.pos);
+            tokganPhase(prog, "transform keys");
             nulls[pd.pid] = nl;
             pd = null; data.persons[pi] = null;
         }
@@ -1067,10 +1134,12 @@ __COMMON__
             // Parent BEFORE keying, without compensation: the keyed values
             // are already in the parent's space.
             if (nulls[sd.pid]) sl.setParentWithJump(nulls[sd.pid]);
+            sl.motionBlur = true;
+            tokganPhase(prog, "layers");
             var st = scaled(sd.times);
             keyLinear(sl.transform.position, st, sd.xf.pos);
             keyLinear(sl.transform.rotation, st, sd.xf.rot);
-            sl.motionBlur = true;
+            tokganPhase(prog, "transform keys");
 
             var root = sl.property("ADBE Root Vectors Group");
             var grp = root.addProperty("ADBE Vector Group");
@@ -1086,6 +1155,7 @@ __COMMON__
                 else if (mn === "ADBE Vector Graphic - Fill") fillItem = inside.property(pp);
             }
             if (fillItem && sd.color) fillItem.property("ADBE Vector Fill Color").setValue(sd.color);
+            tokganPhase(prog, "layers");
             var shapesAt = new Array(sd.times.length);
             for (var i = 0; i < sd.times.length; i++) {
                 shapesAt[i] = mkShape(sd.verts[i], sd.inT[i], sd.outT[i], sd.closed);
@@ -1093,6 +1163,7 @@ __COMMON__
             var pathProp = pathItem.property("ADBE Vector Shape");
             try { pathProp.setValuesAtTimes(st, shapesAt); }
             catch (e) { for (var j = 0; j < st.length; j++) pathProp.setValueAtTime(st[j], shapesAt[j]); }
+            tokganPhase(prog, "path keys");
 
             if (sd.opacity.length > 0) {
                 var op = grp.property("ADBE Vector Transform Group").property("ADBE Vector Group Opacity");
@@ -1100,6 +1171,7 @@ __COMMON__
             }
             // Keyed: release this part's data.
             shapesAt = null; st = null; sd = null; data.shapes[s] = null;
+            tokganPhase(prog, "visibility keys");
         }
 
         STEP = tokganStep(prog, "camera (" + data.camera.times.length + " keys)");
@@ -1122,8 +1194,10 @@ __COMMON__
             keyLinear(pin.property(names[c]), ct, vals);
         }
         vals = null; corners = null; ct = null;
+        tokganPhase(prog, "camera");
 
         tokganCommentNote(comp, timing.note);
+        tokganPhase(prog, "comp");
         app.endUndoGroup();
         var summary = "Imported " + data.persons.length + " person(s), " + data.shapes.length +
                       " part layers, " + data.camera.times.length + " camera keys";
@@ -1172,11 +1246,13 @@ __COMMON__
         if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
         var raw = dataFile.read();
         dataFile.close();
+        tokganPhase(prog, "read");
 
         STEP = tokganStep(prog, "json-parse (" + raw.length + " chars)");
         var t0 = (new Date()).getTime();
         var data = tokganParse(raw);
         raw = null;
+        tokganPhase(prog, "parse");
         var tParse = ((new Date()).getTime() - t0) / 1000;
         if (data.mode !== "masks" || !data.solids) {
             throw new Error(dataFile.displayName + " is not a Tokgan Solid + masks sidecar; " +
@@ -1240,12 +1316,14 @@ __COMMON__
                 mask.name = md.name;
                 mask.maskMode = MaskMode.ADD;
                 mask.property("ADBE Mask Feather").setValue([0, 0]);
+                tokganPhase(prog, "layers");
 
                 var shapesAt = new Array(md.times.length);
                 for (var i = 0; i < md.times.length; i++) {
                     shapesAt[i] = mkShape(md.verts[i], md.inT[i], md.outT[i], md.closed);
                 }
                 mask.property("ADBE Mask Shape").setValuesAtTimes(scaled(md.times), shapesAt);
+                tokganPhase(prog, "path keys");
 
                 // Visibility: Mask Opacity 0/100, held, so a part that is
                 // not in a frame adds nothing to the solid's alpha there.
@@ -1263,6 +1341,7 @@ __COMMON__
                     }
                 }
                 nMasks++;
+                tokganPhase(prog, "visibility keys");
                 // Keyed: release this mask's data.
                 shapesAt = null; md = null; sd.masks[m] = null;
             }
@@ -1271,6 +1350,7 @@ __COMMON__
 
         tokganCommentNote(comp, timing.note);
         var tDone = ((new Date()).getTime() - tBuild) / 1000;
+        tokganPhase(prog, "comp");
         app.endUndoGroup();
         var summary = "Imported " + data.solids.length + " solid(s), " + nMasks + " masks (JSON parse " +
                       tParse.toFixed(1) + " s, AE build " + tDone.toFixed(1) + " s)";
