@@ -692,6 +692,7 @@ COMMON_JS = r"""
         // The end of an import: the summary (and any note) stays in the
         // palette until the operator closes it.
         function tokganDone(pr, summary, note) {
+            if (pr.storageNote) note = note ? note + "\n\n" + pr.storageNote : pr.storageNote;
             tokganPhase(pr, "finish");
             var t = tokganElapsed(pr).toFixed(1);
             tokganLog(pr, "[" + tokganStamp() + " +" + t + "s] done: " + summary + " in " + t + " s");
@@ -748,6 +749,82 @@ COMMON_JS = r"""
             } catch (eCm) {
                 $.writeln("[Tokgan] could not set the comp comment: " + eCm.toString());
             }
+        }
+
+        // Storage check (#458). Reading the sidecar is one File.read; a
+        // 1-person, 182-frame shot (8 MB) reads in about 0.1 s on a local
+        // disk. The log records how fast it was and what kind of location
+        // the file is in. A slow read is timed again from a copy in the
+        // system temp folder, so the log shows whether the time goes to
+        // where the file is stored (a network share, a cloud-synced folder,
+        // antivirus scanning) rather than to After Effects or this script.
+        var TOKGAN_SLOW_READ_S = 2.0, TOKGAN_SLOW_READ_MBPS = 20;
+        function tokganWhere(f) {
+            var p = String(f.fsName), l = p.toLowerCase();
+            var cloud = ["onedrive", "dropbox", "icloud", "mobile documents", "cloudstorage",
+                         "google drive", "googledrive", "creative cloud files", "box sync"];
+            for (var i = 0; i < cloud.length; i++) {
+                if (l.indexOf(cloud[i]) >= 0) return "a cloud-synced folder (" + cloud[i] + ")";
+            }
+            if (p.indexOf("\\\\") === 0 || p.indexOf("//") === 0) return "a network share";
+            if (l.indexOf("/volumes/") === 0) return "an external or network volume";
+            if (/^\/(net|mnt|smb|nfs|afp)\//.test(l)) return "a network mount";
+            return "a local folder";
+        }
+        function tokganTimedRead(f) {
+            var t0 = (new Date()).getTime();
+            f.encoding = "UTF-8";
+            if (!f.open("r")) throw new Error("File.open returned false for " + f.fsName);
+            var text = f.read();
+            f.close();
+            return { text: text, secs: ((new Date()).getTime() - t0) / 1000 };
+        }
+        function tokganStorageCheck(pr, f, secs) {
+            var tmp = null;
+            try {
+                tmp = new File(Folder.temp.fsName + "/tokgan_storage_check_" + (new Date()).getTime() + ".json");
+                var c0 = (new Date()).getTime();
+                if (!f.copy(tmp.fsName)) {
+                    tokganLog(pr, "storage-check: could not copy the sidecar to " + Folder.temp.fsName);
+                    return;
+                }
+                var copySecs = ((new Date()).getTime() - c0) / 1000;
+                var again = tokganTimedRead(tmp);
+                var verdict;
+                if (again.secs * 5 <= secs) {
+                    verdict = "Reading the shape data took " + secs.toFixed(1) + " s where it is stored, but " +
+                              again.secs.toFixed(1) + " s from a copy in the system temp folder: the time goes " +
+                              "to the storage (" + tokganWhere(f) + "; a network share, cloud sync or " +
+                              "antivirus scanning can do this), not to After Effects or the importer. " +
+                              "Copying the shot folder to a local disk before importing should help.";
+                } else {
+                    verdict = "Reading the shape data took " + secs.toFixed(1) + " s, and " +
+                              again.secs.toFixed(1) + " s again from a copy in the system temp folder: " +
+                              "reading files is slow on this machine in general.";
+                }
+                tokganLog(pr, "storage-check: copy to temp " + copySecs.toFixed(2) + " s, read from temp " +
+                              again.secs.toFixed(2) + " s, read where stored " + secs.toFixed(2) + " s");
+                pr.storageNote = verdict;
+            } catch (eSc) {
+                tokganLog(pr, "storage-check: skipped (" + eSc.toString() + ")");
+            } finally {
+                try { if (tmp && tmp.exists) tmp.remove(); } catch (eRm) {}
+            }
+        }
+        // Reads the sidecar, logs the storage line, and runs the check when
+        // the read was slow. The check's time is charged to its own phase.
+        function tokganReadSidecar(pr, f) {
+            var r = tokganTimedRead(f);
+            var mb = (f.length > 0 ? f.length : r.text.length) / 1048576;
+            tokganLog(pr, "storage: " + mb.toFixed(1) + " MB read in " + r.secs.toFixed(2) + " s" +
+                          (r.secs > 0 ? " (" + (mb / r.secs).toFixed(0) + " MB/s)" : "") +
+                          " from " + tokganWhere(f));
+            tokganPhase(pr, "read");
+            if (r.secs >= TOKGAN_SLOW_READ_S && mb / r.secs < TOKGAN_SLOW_READ_MBPS) {
+                tokganStorageCheck(pr, f, r.secs);
+                tokganPhase(pr, "storage check");
+            }
+            return r.text;
         }
 
         // The sidecar: by path first (no folder listing), then by listing
@@ -822,12 +899,7 @@ LOADER_TEMPLATE = r"""// Auto-generated AE loader for Tokgan shape data.
         }}
 
         STEP = tokganStep(prog, "read-sidecar (" + dataFile.fsName + ", " + dataFile.length + " bytes)");
-        dataFile.encoding = "UTF-8";
-        if (!dataFile.open("r")) {{
-            throw new Error("File.open returned false for " + dataFile.fsName);
-        }}
-        var raw = dataFile.read();
-        dataFile.close();
+        var raw = tokganReadSidecar(prog, dataFile);
         tokganPhase(prog, "read");
         if (!raw || raw.length === 0) {{
             throw new Error("File.read returned empty string");
@@ -1011,10 +1083,7 @@ __COMMON__
         }
 
         STEP = tokganStep(prog, "read-sidecar (" + dataFile.fsName + ", " + dataFile.length + " bytes)");
-        dataFile.encoding = "UTF-8";
-        if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
-        var raw = dataFile.read();
-        dataFile.close();
+        var raw = tokganReadSidecar(prog, dataFile);
         tokganPhase(prog, "read");
 
         STEP = tokganStep(prog, "json-parse (" + raw.length + " chars)");
@@ -1242,10 +1311,7 @@ __COMMON__
         }
 
         STEP = tokganStep(prog, "read-sidecar (" + dataFile.fsName + ", " + dataFile.length + " bytes)");
-        dataFile.encoding = "UTF-8";
-        if (!dataFile.open("r")) throw new Error("File.open returned false for " + dataFile.fsName);
-        var raw = dataFile.read();
-        dataFile.close();
+        var raw = tokganReadSidecar(prog, dataFile);
         tokganPhase(prog, "read");
 
         STEP = tokganStep(prog, "json-parse (" + raw.length + " chars)");
