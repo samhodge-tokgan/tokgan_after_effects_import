@@ -106,6 +106,8 @@ const project = {
   item(i) { return this._items[i - 1]; },
   items: { addComp(...a) { const c = new CompItem(...a); project._items.push(c); return c; } },
 };
+const os = require("os");
+const MOCK_TEMP = fs.mkdtempSync(path.join(os.tmpdir(), "tokgan-ae-mock-"));
 class FakeFile {
   constructor(p) { this.fsName = p; this.displayName = path.basename(p); }
   get parent() { const d = path.dirname(this.fsName); return { fsName: d, getFiles: () => fs.readdirSync(d).map(n => new FakeFile(path.join(d, n))) }; }
@@ -116,7 +118,15 @@ class FakeFile {
     if (this.mode === "w") fs.writeFileSync(this.fsName, "");
     return this.mode !== "r" || this.exists;
   }
-  close() {} read() { return fs.readFileSync(this.fsName, "utf8"); }
+  close() {}
+  read() {
+    // TOKGAN_MOCK_READ_DELAY_MS: a slow store (network share, cloud sync), for every file outside the temp folder.
+    const ms = Number(process.env.TOKGAN_MOCK_READ_DELAY_MS || 0);
+    if (ms > 0 && !this.fsName.startsWith(MOCK_TEMP)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    return fs.readFileSync(this.fsName, "utf8");
+  }
+  copy(dest) { try { fs.copyFileSync(this.fsName, dest); return true; } catch (e) { return false; } }
+  remove() { try { fs.unlinkSync(this.fsName); return true; } catch (e) { return false; } }
   writeln(s) { fs.appendFileSync(this.fsName, s + "\n"); }
 }
 FakeFile.openDialog = () => null;
@@ -132,7 +142,7 @@ class Window {
 const logs = [];
 const ctx = {
   $: { fileName: path.resolve(jsxPath), writeln: s => logs.push(s) },
-  File: FakeFile, Shape, CompItem, Window,
+  File: FakeFile, Folder: { temp: { fsName: MOCK_TEMP } }, Shape, CompItem, Window,
   app: { project, version: "mock", beginUndoGroup() {}, endUndoGroup() {} },
   PropertyValueType: { TwoD_SPATIAL: "TwoD_SPATIAL", ThreeD_SPATIAL: "ThreeD_SPATIAL" },
   KeyframeInterpolationType: { LINEAR: "LINEAR", HOLD: "HOLD" },
@@ -146,10 +156,13 @@ if (activeFps) {
   project.activeItem = plate;
 }
 vm.runInNewContext(fs.readFileSync(jsxPath, "utf8"), ctx);
-if (activeFps) {
+if (activeFps || process.env.AE_MOCK_REPORT) {
+  // AE_MOCK_REPORT: report what the operator would see (palette, log, comment) for any loader, without
+  // recomposing; temp_left lists what the import left in the system temp folder.
   const logPath = jsxPath.replace(/\.jsx$/i, "") + "_import.log";
   console.log(JSON.stringify({
-    comment: project.activeItem.comment,
+    comment: project.activeItem ? project.activeItem.comment : null,
+    temp_left: fs.readdirSync(MOCK_TEMP),
     palette: palettes.map(w => ({ type: w.type, shown: w.shown, text: w.controls.filter(c => c.kind === "statictext").map(c => c.text) })),
     log: fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : null,
   }));

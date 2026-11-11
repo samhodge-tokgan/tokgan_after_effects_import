@@ -297,3 +297,41 @@ class TestConvertAPI:
         assert r.mode == "flat"
         assert Path(r.jsx).name == "shot_010.jsx"
         assert Path(r.data).name == "shot_010_data.json"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+class TestStorageCheck:
+    """(The mock has no solids/masks, so the masks loader, which shares the same helper, is not run here.)
+    #458: the import log says how fast the sidecar was read and from what kind of location. A slow read is
+    timed again from a copy in the system temp folder, so a customer's log shows whether the time goes to
+    the storage (network share, cloud sync, antivirus) rather than to After Effects or the importer."""
+
+    def _run(self, tmp_path, delay_ms=0, *args):
+        src = tmp_path / "clip.json"
+        src.write_text((FIXTURES / "v3_real_cut.json").read_text())
+        r = subprocess.run([sys.executable, str(SCRIPT), str(src), *args], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        env = {**os.environ, "TOKGAN_MOCK_READ_DELAY_MS": str(delay_ms), "AE_MOCK_REPORT": "1"}
+        out = subprocess.run(["node", str(HERE / "ae_mock.js"), str(tmp_path / "clip.jsx"), str(src)],
+                             capture_output=True, text=True, env=env)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    @pytest.mark.parametrize("args", [(), ("--flat",)])
+    def test_a_fast_read_logs_the_storage_line_only(self, tmp_path, args):
+        res = self._run(tmp_path, 0, *args)
+        assert "storage: " in res["log"] and " from a local folder" in res["log"]
+        assert "storage-check" not in res["log"]
+        assert "storage check" not in res["log"].split("phases: ")[-1].splitlines()[0]
+
+    @pytest.mark.parametrize("args", [(), ("--flat",)])
+    def test_a_slow_store_is_named_and_the_temp_copy_removed(self, tmp_path, args):
+        res = self._run(tmp_path, 2200, *args)
+        log = res["log"]
+        assert "storage-check: copy to temp" in log and "read from temp" in log
+        assert "the time goes to the storage" in log
+        assert "storage check" in log.split("phases: ")[-1]
+        (pal,) = res["palette"]
+        assert "not to After Effects or the importer" in pal["text"][-1]
+        tmp = res.get("temp_left")
+        assert tmp == [], tmp

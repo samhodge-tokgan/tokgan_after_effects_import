@@ -2,4 +2,4 @@
 # Change them there, then re-sync (packaging/ci/sync-downstream-dcc.sh); Rotobot-Next CI fails if they
 # are edited here (packaging/ci/check-downstream-dcc-sync.sh).
 repo    https://github.com/samhodge-tokgan/Rotobot-Next
-commit  242df0cf1c9557d4043319c867b027699916f917  (AE import: drop the per-key interpolation walk (quadratic in shot length); log time per phase (#458) (#532))
+commit  f8937fa7bc3e40ae191dec12df6607c4a8f585ca  (AE import: storage check in the import log (#458) (#542))
